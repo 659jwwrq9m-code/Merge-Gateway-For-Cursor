@@ -78,14 +78,115 @@ POST /v1/responses                 Gateway-native Responses
 - Node.js 20.12+ (uses `process.loadEnvFile`; older runtimes fall back to a
   built-in parser)
 - A Merge Gateway API key from [dashboard.merge.dev](https://dashboard.merge.dev)
+- Cursor, with Agent mode — [download](https://cursor.com/downloads) (macOS,
+  Windows, and Linux)
+
+## Install
+
+### macOS
+
+Node is the only dependency. If you use [Homebrew](https://brew.sh):
+
+```sh
+brew install node
+```
+
+Otherwise install the official package from [nodejs.org](https://nodejs.org).
+Either way, confirm you are on 20.12 or newer — `node --version`.
+
+Then clone and build:
+
+```sh
+git clone https://github.com/659jwwrq9m-code/Merge-Gateway-For-Cursor.git
+cd Merge-Gateway-For-Cursor
+npm install
+npm run build
+```
+
+### Windows
+
+Install Node from [nodejs.org](https://nodejs.org) or with winget:
+
+```powershell
+winget install OpenJS.NodeJS.LTS
+```
+
+Use **PowerShell** rather than `cmd.exe`. Confirm `node --version` reports 20.12
+or newer, then:
+
+```powershell
+git clone https://github.com/659jwwrq9m-code/Merge-Gateway-For-Cursor.git
+cd Merge-Gateway-For-Cursor
+npm install
+npm run build
+```
+
+Two Windows specifics:
+
+- If `git` or `node` is not recognised, reopen PowerShell. The installer updates
+  `PATH`, but an already-open shell keeps the old one.
+- Long paths can break `npm install`. If it fails on a deep dependency, enable
+  them once from an **Administrator** PowerShell:
+
+  ```powershell
+  git config --global core.longpaths true
+  ```
+
+`npm start` and `npm test` are identical across both platforms. Where the two
+differ is environment variables — see
+[Environment variables per platform](#environment-variables-per-platform).
+
+### Linux
+
+Cursor ships a Linux build (`.deb`, `.rpm`, and AppImage, for x64 and ARM64),
+so the shim works there too.
+
+Install Node 20.12+ first — use your distribution's packages rather than a
+download, so the runtime stays patched:
+
+```sh
+# Debian / Ubuntu
+sudo apt install nodejs npm
+
+# Fedora / RHEL
+sudo dnf install nodejs npm
+
+# Arch
+sudo pacman -S nodejs npm
+```
+
+Distribution packages often lag. Check `node --version` and if it is below
+20.12, use [nvm](https://github.com/nvm-sh/nvm) or
+[nodesource](https://github.com/nodesource/distributions) instead.
+
+Then clone and build:
+
+```sh
+git clone https://github.com/659jwwrq9m-code/Merge-Gateway-For-Cursor.git
+cd Merge-Gateway-For-Cursor
+npm install
+npm run build
+```
+
+One Linux-specific note: **the shim binds loopback only by default, and that is
+worth keeping** — it forwards your Gateway key. If you already run something on
+port 8787, change `SHIM_PORT` rather than binding `0.0.0.0`.
 
 ## Setup
 
+Copy the template and put your key in it:
+
 ```sh
+# macOS and Linux
 cp .env.example .env
 ```
 
-Put your key in `.env`:
+```powershell
+# Windows
+Copy-Item .env.example .env
+```
+
+Use any editor to set your key in `.env`:
 
 ```ini
 MERGE_GATEWAY_API_KEY=your_key_here
@@ -103,10 +204,10 @@ shim resolved configuration
   applied from .env   MERGE_GATEWAY_API_KEY
   gateway base url    https://api-gateway.merge.dev/v1/openai
   api key             mg_abc…9xyz (35 chars)
-  listen              http://127.0.0.1:8787/v1
+  listen              http://localhost:8787/v1
   mode                capture only (no upstream calls)
   capture dir         /path/to/merge-gateway-shim/captures
-  cursor base url     http://127.0.0.1:8787/v1
+  cursor base url     http://localhost:8787/v1
 
 shim verifying key against Gateway…
 shim ✓ key accepted, 214 model(s) visible
@@ -129,11 +230,37 @@ Highest wins:
 run wins without editing the file:
 
 ```sh
+# macOS and Linux
 MERGE_GATEWAY_API_KEY=mg_other_key npm start
+```
+
+```powershell
+# Windows PowerShell
+$env:MERGE_GATEWAY_API_KEY = "mg_other_key"; npm start
 ```
 
 `--check` reports which source each variable came from (`applied from .env` vs
 `already in shell (shell wins)`), and the key is always masked.
+
+### Environment variables per platform
+
+`npm start` is the same everywhere. Setting a variable for a single run is not,
+and `.env` means you rarely need to.
+
+| | macOS / Linux (`bash`, `zsh`) | Windows (PowerShell) |
+| --- | --- | --- |
+| One run | `SHIM_PASSTHROUGH=1 npm start` | `$env:SHIM_PASSTHROUGH=1; npm start` |
+| This session | `export SHIM_PASSTHROUGH=1` | `$env:SHIM_PASSTHROUGH = "1"` |
+| Persist for user | add to `~/.zshrc` | `setx SHIM_PASSTHROUGH 1` (new shells only) |
+| Unset | `unset SHIM_PASSTHROUGH` | `Remove-Item Env:SHIM_PASSTHROUGH` |
+
+`setx` applies to *future* shells, not the current one — a common source of
+confusion when the change appears not to take effect. And do not use `cmd.exe`
+for these examples; `set VAR=1` works there, but the escaping differs and the
+rest of this document assumes PowerShell.
+
+The simplest path on every platform is to put the setting in `.env` and leave
+shell variables alone.
 
 ## Step 1 — survey Cursor's traffic
 
@@ -165,38 +292,186 @@ Cursor used, which dialect it sent, how the tools were shaped, and whether the
 Credentials are redacted on write — `Authorization: Bearer ••••`, keeping the
 scheme so a capture still shows *how* auth was sent. Captures are safe to share.
 
-Point Cursor at it:
+## Step 2 — point Cursor at the shim
+
+**Capture mode is the default**, so you can do this before spending anything.
+The shim answers every request locally and records it.
+
+In Cursor:
 
 1. **Settings → Cursor Settings → Models**
-2. Enable **OpenAI API Key** — any placeholder works; the shim holds the real key
-3. Enable **Override OpenAI Base URL** → `http://127.0.0.1:8787/v1`
-4. **+ Add Custom Model** → `anthropic/claude-opus-5` (or any Gateway id)
-5. Send a message in **Agent mode**
+2. Enable **OpenAI API Key** — any non-empty placeholder works, because the shim
+   holds the real Gateway key. Cursor only requires that the field is filled.
+3. Enable **Override OpenAI Base URL** → `http://localhost:8787/v1`
+4. Click **+ Add Custom Model** and add a Gateway model id, e.g.
+   `zai/glm-5.3-flash` or `anthropic/claude-opus-5`
+5. Switch to **Agent mode** and send a message
 
-If you get connection errors, set **Settings → Network → HTTP Compatibility Mode**
-to **HTTP/1.1**. Cursor defaults to HTTP/2 and many local proxies do not serve it.
+Use `localhost` rather than `127.0.0.1`. The shim binds both loopback stacks,
+and `localhost` is what Cursor and Xcode produce by default.
 
-## Step 2 — turn on passthrough
+If you get connection or TLS errors, set
+**Settings → Cursor Settings → Network → HTTP Compatibility Mode** to
+**HTTP/1.1**. The same setting lives in the desktop and web settings panes.
+Cursor defaults to HTTP/2, and many local proxies do not serve it.
 
-Once you have a capture, forward to Gateway:
+### Model ids
+
+Cursor rewrites a custom model id that collides with a name in its own catalogue
+— `glm-5.2` becomes `glm-5.2-high` before it leaves. Gateway ids are
+`provider/model`, which do not collide, so **always use the full
+`provider/model` form** and you will not hit it.
+
+## Step 3 — turn on passthrough
+
+Once Cursor is talking to the shim, forward to Gateway:
 
 ```sh
 SHIM_PASSTHROUGH=1 npm start
 ```
 
-Or in `.env`:
+```powershell
+# Windows PowerShell
+$env:SHIM_PASSTHROUGH=1; npm start
+```
+
+Or set it once in `.env` so it applies on every platform:
 
 ```ini
 SHIM_PASSTHROUGH=1
 ```
 
-Passthrough is off by default specifically so that capture mode cannot spend
-money. The shim logs when it is billing:
+Passthrough is off by default specifically so capture mode cannot spend money.
+The shim says plainly when it is billing:
 
 ```
-shim listening on http://127.0.0.1:8787/v1 · passthrough → Gateway
+shim listening on http://localhost:8787/v1 · passthrough → Gateway
 shim passthrough is on: requests will be forwarded to Gateway and billed.
 ```
+
+### Verify without Cursor
+
+Before blaming the editor, confirm the shim itself is healthy:
+
+```sh
+curl http://localhost:8787/health
+```
+
+```powershell
+# Windows PowerShell
+Invoke-RestMethod http://localhost:8787/health
+```
+
+That endpoint is open even when `SHIM_CLIENT_KEY` is set, so it is always safe
+to check. Add `--check` for a fuller report that does not need the server
+running and does not spend tokens:
+
+```sh
+npm run check:env
+```
+
+## Running it from anywhere
+
+Cursor calls the base URL directly, so **the shim must already be running**. It
+does not start anything for you, and a closed terminal takes it down.
+
+To keep it up, run it in the background. On macOS and Linux:
+
+```sh
+nohup npm start > /tmp/shim.log 2>&1 &
+```
+
+On Windows, use a second PowerShell window, or register a scheduled task:
+
+```powershell
+Start-Process -NoNewWindow npm -ArgumentList "start" -RedirectStandardOutput shim.log
+```
+
+`npm start` binds loopback only, so nothing outside your machine can reach it —
+which is why the key inside it stays safe. That changes the moment you expose
+it, and the next section covers what to do about it.
+
+## Reaching it from another machine (Cloudflare Tunnel)
+
+Loopback is the right default: the shim holds your Gateway key, so anything that
+can reach it can spend your credit. Sometimes you genuinely need it reachable
+from elsewhere — a remote dev box, a teammate, a cloud agent.
+
+**`SHIM_CLIENT_KEY` is mandatory the moment you do this.** Without it, an
+exposed shim is an open proxy to your Gateway account. Set a long random value:
+
+```sh
+openssl rand -hex 32
+```
+
+```powershell
+# Windows PowerShell
+-join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })
+```
+
+Put it in `.env` so every start uses it:
+
+```ini
+SHIM_CLIENT_KEY=the_generated_value
+```
+
+Cursor then needs that same value in its **OpenAI API Key** field, instead of a
+placeholder.
+
+### Expose it
+
+```sh
+# macOS
+brew install cloudflared
+```
+
+```sh
+# Linux (.deb / .rpm — see Cloudflare's docs for other distros)
+# https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+```
+
+```powershell
+# Windows
+winget install --id Cloudflare.cloudflared
+```
+
+A quick tunnel needs no Cloudflare account and prints a public URL:
+
+```sh
+cloudflared tunnel --url http://localhost:8787
+```
+
+The shim's own tunnel handling is much simpler if you give `cloudflared` its own
+config, because a `~/.cloudflared/config.yml` with an ingress list silently
+overrides the `--url` flag and will return `404` for every request:
+
+```sh
+printf 'metrics: 127.0.0.1:20241\n' > /tmp/cf-quick.yml
+cloudflared tunnel --config /tmp/cf-quick.yml --url http://localhost:8787
+```
+
+It prints a URL like `https://something-something.trycloudflare.com`. Point
+Cursor's base URL at `https://that-host/v1` and set the API key to your
+`SHIM_CLIENT_KEY`.
+
+Then confirm the gate is actually closed — this should return `401`, not `200`:
+
+```sh
+curl -o /dev/null -w '%{http_code}\n' https://that-host/v1/models
+```
+
+```powershell
+(Invoke-WebRequest https://that-host/v1/models -SkipHttpErrorCheck).StatusCode
+```
+
+Two caveats on quick tunnels:
+
+- **The URL is temporary.** It is regenerated whenever `cloudflared` restarts, so
+  Cursor's base URL has to be updated to match. For anything long-lived, set up a
+  [named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+  with a stable hostname instead.
+- **Quick tunnels are public.** Anyone who learns the URL can reach the shim.
+  `SHIM_CLIENT_KEY` is what stops them getting further.
 
 ## Configuration reference
 
@@ -205,7 +480,7 @@ shim passthrough is on: requests will be forwarded to Gateway and billed.
 | `MERGE_GATEWAY_API_KEY` | — | Gateway key. Required for passthrough |
 | `MERGE_GATEWAY_BASE_URL` | `https://api-gateway.merge.dev/v1/openai` | Gateway's OpenAI surface |
 | `MERGE_GATEWAY_PROJECT_ID` | — | Sent as `X-Merge-Project-Id` to attribute cost and apply that project's routing policy |
-| `SHIM_HOST` | `127.0.0.1` | Bind address |
+| `SHIM_HOST` | `localhost` | Bind address. `localhost` binds **both** loopback stacks (IPv4 and IPv6), unlike `127.0.0.1` |
 | `SHIM_PORT` | `8787` | Listen port |
 | `SHIM_MODEL` | — | Fallback model id when Cursor sends none |
 | `SHIM_CAPTURE_DIR` | `captures` | Where captures are written |
@@ -218,7 +493,10 @@ shim passthrough is on: requests will be forwarded to Gateway and billed.
 | `SHIM_QUIET` | `0` | Suppress per-request lines |
 | `SHIM_DEBUG` | — | Verbose translation diagnostics |
 
-Run `node dist/index.js --help` for the flag equivalents.
+Run `node dist/index.js --help` for the flag equivalents. **`--no-env`** skips
+`.env` entirely and uses only the shell environment, which is useful for
+isolating a run from local configuration — note that the file is read straight
+off disk, so clearing shell variables is not enough to escape it.
 
 ## Endpoints
 
@@ -412,6 +690,11 @@ src/server.ts     HTTP routing
 
 - The shim forwards your Gateway key, so it binds loopback-only by default.
   Binding `SHIM_HOST` elsewhere exposes the key; `--check` warns if you do.
+- **Tunnelling is the same exposure by another route**, and it is the case people
+  actually hit. `SHIM_CLIENT_KEY` is required for it, and there is no way to
+  tunnel without setting it and still be safe — an exposed shim without it
+  forwards any caller's requests to Gateway on your key. See
+  [Reaching it from another machine](#reaching-it-from-another-machine-cloudflare-tunnel).
 - Credentials are redacted before anything touches disk.
 - `.env` and `captures/` are gitignored.
 - The `.env` parser is not a shell — no interpolation, no command substitution —

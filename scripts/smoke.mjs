@@ -108,11 +108,20 @@ const chatShaped = {
 async function main() {
   console.log(`\nshim smoke test (capture dir: ${captureDir})\n`);
 
-  const child = spawn(process.execPath, [entry, "--port", String(PORT), "--capture-dir", captureDir], {
-    cwd: root,
-    env: { ...process.env, SHIM_PASSTHROUGH: "0" },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  // `--no-env` is what actually isolates the child. Scrubbing the environment
+  // is not enough: the shim reads `.env` straight off disk, so a developer's own
+  // SHIM_CLIENT_KEY would apply to the test server and turn every request below
+  // into a 401, failing the suite for a correct shim purely because of how the
+  // machine running it is configured.
+  const child = spawn(
+    process.execPath,
+    [entry, "--port", String(PORT), "--capture-dir", captureDir, "--no-env"],
+    {
+      cwd: root,
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR, SHIM_PASSTHROUGH: "0" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
 
   const logs = [];
   child.stderr.on("data", (d) => logs.push(d.toString()));

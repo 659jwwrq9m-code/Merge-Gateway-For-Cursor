@@ -105,8 +105,15 @@ function parseEnvFallback(body: string): Record<string, string> {
  *
  * Returns what happened so `--check` can show it; never throws, because a
  * malformed `.env` should degrade to "no key configured", not a crash.
+ *
+ * Pass `null` to skip the file entirely, which is what `--no-env` does. That
+ * exists so a run can be isolated from a developer's local configuration: the
+ * file is read straight off disk, so scrubbing the process environment is not
+ * enough to escape it, and a `SHIM_CLIENT_KEY` sitting in `.env` will otherwise
+ * turn a test's own requests into 401s.
  */
-export function loadEnv(path: string = defaultEnvPath): LoadEnvResult {
+export function loadEnv(path: string | null = defaultEnvPath): LoadEnvResult {
+  if (path === null) return { path: "(skipped)", found: false, applied: [], overridden: [] };
   if (!existsSync(path)) return { path, found: false, applied: [], overridden: [] };
 
   let body: string;
@@ -209,6 +216,8 @@ export interface ShimFlags {
   passthrough?: boolean;
   noCapture?: boolean;
   noModelFilter?: boolean;
+  /** Skip reading `.env`, isolating the run from local configuration. */
+  noEnv?: boolean;
   quiet?: boolean;
 }
 

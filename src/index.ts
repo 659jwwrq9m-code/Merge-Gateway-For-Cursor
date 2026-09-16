@@ -28,13 +28,14 @@ Usage
 Options
   --check              Print resolved config, verify the Gateway key, exit
   --port <n>           Port to listen on                 (SHIM_PORT, default 8787)
-  --host <addr>        Address to bind                   (SHIM_HOST, default 127.0.0.1)
+  --host <addr>        Address to bind                   (SHIM_HOST, default localhost)
   --gateway-url <url>  Gateway OpenAI base URL           (MERGE_GATEWAY_BASE_URL)
   --model <id>         Fallback model id                 (SHIM_MODEL)
   --capture-dir <dir>  Where captures are written        (SHIM_CAPTURE_DIR)
   --passthrough        Forward to Gateway                (SHIM_PASSTHROUGH=1)
   --no-capture         Do not write capture files        (SHIM_CAPTURE=0)
   --no-model-filter    Advertise every model, unfiltered  (SHIM_FILTER_MODELS=0)
+  --no-env             Ignore .env, use the shell environment only
   --quiet              Suppress per-request lines        (SHIM_QUIET=1)
   -h, --help           Show this help
 
@@ -74,6 +75,9 @@ function parseArgs(argv: string[]): { flags: ShimFlags; unknown: string[] } {
         break;
       case "--no-model-filter":
         flags.noModelFilter = true;
+        break;
+      case "--no-env":
+        flags.noEnv = true;
         break;
       case "--quiet":
         flags.quiet = true;
@@ -131,12 +135,24 @@ async function verifyKey(gatewayBaseUrl: string, apiKey: string): Promise<{ ok: 
   }
 }
 
-async function check(): Promise<number> {
-  const env = loadEnv();
+/**
+ * How `--check` describes where the `.env` values came from.
+ *
+ * A skipped file and a missing file are different situations and read as such:
+ * "not found" tells someone to copy `.env.example`, whereas "(skipped by
+ * --no-env)" tells them why the key they can see on disk is not being used.
+ */
+function describeEnvSource(env: { path: string; found: boolean }): string {
+  if (env.path === "(skipped)") return "(skipped by --no-env)";
+  return env.found ? env.path : `${env.path} (not found)`;
+}
+
+async function check(flags: ShimFlags = {}): Promise<number> {
+  const env = loadEnv(flags.noEnv ? null : undefined);
   const config = resolveConfig({}, process.env);
 
   info("resolved configuration");
-  process.stderr.write(`  .env                ${env.found ? env.path : `${env.path} (not found)`}\n`);
+  process.stderr.write(`  .env                ${describeEnvSource(env)}\n`);
   if (env.found) {
     if (env.applied.length > 0) process.stderr.write(`  applied from .env   ${env.applied.join(", ")}\n`);
     if (env.overridden.length > 0) {
@@ -187,8 +203,9 @@ async function main(): Promise<void> {
 
   // `.env` is loaded before anything reads process.env, and never overwrites a
   // variable that is already set. `--check` loads it itself so it stays usable
-  // as a standalone diagnostic.
-  if (!flags.check) loadEnv();
+  // as a standalone diagnostic. `--no-env` skips it entirely, which is how a run
+  // is isolated from a developer's local configuration.
+  if (!flags.check && !flags.noEnv) loadEnv();
 
   if (flags.help) {
     process.stderr.write(`${USAGE}\n`);
@@ -201,7 +218,7 @@ async function main(): Promise<void> {
   }
 
   if (flags.check) {
-    process.exit(await check());
+    process.exit(await check(flags));
   }
 
   const config = resolveConfig(flags);
