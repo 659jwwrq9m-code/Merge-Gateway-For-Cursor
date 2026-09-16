@@ -82,3 +82,21 @@ export async function forwardModels(config: ShimConfig): Promise<Response> {
   if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
   return fetch(url, { method: "GET", headers });
 }
+
+/**
+ * Fetch Gateway's *native* catalogue, which is where per-model capabilities are
+ * published.
+ *
+ * The OpenAI surface advertises ids but not what they can do, so this is the
+ * only source for "supports tool calling". It is derived from the OpenAI base
+ * URL rather than configured separately: `/v1/openai` is a surface mounted on
+ * the same host, so stripping it lands on the native root. Keeping it derived
+ * means one setting still points the shim at Gateway.
+ */
+export async function forwardNativeModels(config: ShimConfig): Promise<Response> {
+  const root = config.gatewayBaseUrl.replace(/\/openai\/?$/, "");
+  const url = joinUrl(root, "models");
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  return fetch(url, { method: "GET", headers });
+}

@@ -30,7 +30,8 @@ import { errorBody, jsonCompletion, jsonResponse, sseCompletion, sseResponse } f
 import type { ShimConfig } from "./config.js";
 import { classifyBody, describeShape, type BodyShape } from "./shape.js";
 import { toChatCompletions } from "./translate.js";
-import { forwardChatCompletion, forwardModels, forwardResponses } from "./upstream.js";
+import { forwardChatCompletion, forwardModels, forwardNativeModels, forwardResponses } from "./upstream.js";
+import { orderForPicker, readToolCapable } from "./catalog.js";
 import { debug, info, request as logRequest, warn } from "./log.js";
 
 /** Which wire dialect the request path implies, and therefore the reply shape. */
@@ -126,6 +127,36 @@ export function createShimServer(config: ShimConfig): Server {
 }
 
 /**
+ * Reduce the advertised catalogue to models that can actually call tools.
+ *
+ * Returns undefined when capability could not be determined, so the caller can
+ * fall back to the unfiltered list rather than presenting an empty picker.
+ *
+ * One extra upstream call, on the `GET /models` path only — a picker refresh or
+ * a provider "Verify" click. Completions never come through here, so the cost
+ * sits outside the agent loop entirely.
+ */
+async function filterToToolCapable(config: ShimConfig, entries: unknown[]): Promise<unknown[] | undefined> {
+  try {
+    const native = await forwardNativeModels(config);
+    if (!native.ok) return undefined;
+
+    const catalog = readToolCapable(await native.json());
+    if (catalog.length === 0) return undefined;
+
+    return orderForPicker(
+      entries.filter(
+        (entry): entry is { id: string } =>
+          typeof entry === "object" && entry !== null && typeof (entry as { id?: unknown }).id === "string",
+      ),
+      catalog,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Build the request handler.
  *
  * Separate from the server so the same handler can be attached to more than one
@@ -192,7 +223,23 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
       try {
         const upstream = await forwardModels(config);
         if (upstream.ok) {
-          await relayResponse(res, upstream);
+          if (!config.filterModels) {
+            await relayResponse(res, upstream);
+            return;
+          }
+
+          const payload = (await upstream.json()) as { data?: unknown[] };
+          const entries = Array.isArray(payload.data) ? payload.data : [];
+          const filtered = await filterToToolCapable(config, entries);
+          if (filtered) {
+            sendJson(res, 200, JSON.stringify({ object: "list", data: filtered }));
+            return;
+          }
+
+          // Capability lookup failed. An unfiltered list still works, whereas a
+          // wrongly-filtered one hides models that are fine, so keep what we have.
+          warn("capability lookup failed; serving the unfiltered model list");
+          sendJson(res, 200, JSON.stringify({ object: "list", data: entries }));
           return;
         }
         warn(`Gateway returned ${upstream.status} for the model list; serving a stub instead`);

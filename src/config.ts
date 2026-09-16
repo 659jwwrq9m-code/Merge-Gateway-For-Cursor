@@ -157,6 +157,13 @@ export interface ShimConfig {
   passthrough: boolean;
   /** Cap on buffered request bodies, in bytes. */
   maxBodyBytes: number;
+  /**
+   * Narrow the advertised model list to models that support tool calling.
+   *
+   * On by default because Cursor's Agent mode and Xcode's chat both send tools
+   * immediately, so a model that cannot call them stalls the first turn.
+   */
+  filterModels: boolean;
   quiet: boolean;
 }
 
@@ -183,6 +190,7 @@ export interface ShimFlags {
   captureDir?: string;
   passthrough?: boolean;
   noCapture?: boolean;
+  noModelFilter?: boolean;
   quiet?: boolean;
 }
 
@@ -272,6 +280,7 @@ export function resolveConfig(
       maxBodyMb ? String(Number(maxBodyMb) * 1024 * 1024) : env.SHIM_MAX_BODY_BYTES,
       DEFAULTS.maxBodyBytes,
     ),
+    filterModels: flags.noModelFilter ? false : asBool(env.SHIM_FILTER_MODELS, true),
     quiet: flags.quiet ?? asBool(env.SHIM_QUIET, false),
   };
 }

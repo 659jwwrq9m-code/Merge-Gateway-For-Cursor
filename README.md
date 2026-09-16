@@ -211,6 +211,7 @@ shim passthrough is on: requests will be forwarded to Gateway and billed.
 | `SHIM_CAPTURE_DIR` | `captures` | Where captures are written |
 | `SHIM_CAPTURE` | `1` | Write captures to disk |
 | `SHIM_PASSTHROUGH` | `0` | Forward to Gateway |
+| `SHIM_FILTER_MODELS` | `1` | Offer only models that support tool calling |
 | `SHIM_MAX_BODY_BYTES` | `67108864` | Request body cap (or `SHIM_MAX_BODY_MB`) |
 | `SHIM_QUIET` | `0` | Suppress per-request lines |
 | `SHIM_DEBUG` | — | Verbose translation diagnostics |
@@ -221,15 +222,41 @@ Run `node dist/index.js --help` for the flag equivalents.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/chat/completions` | The endpoint Cursor uses |
-| `GET` | `/v1/models` | Model list — passthrough to Gateway, or a minimal stub |
+| `POST` | `/v1/chat/completions` | The endpoint Cursor and Xcode use |
+| `GET` | `/v1/models` | Model list, filtered to tool-capable models |
 | `GET` | `/health` | Liveness, and which mode is active |
-| `POST` | `/v1/responses` | Returns `501` with guidance rather than a mismatched body |
+| `POST` | `/v1/responses` | Responses in, Responses out — for clients that take that path |
 
-The `/v1/responses` refusal is deliberate. A client posting there expects a
-Responses-shaped reply, and answering with a Chat Completions body would surface
-as a mysterious parse failure further down. A clear `501` naming the right base
-URL is easier to debug.
+## The model list
+
+`GET /v1/models` is not a plain passthrough. Gateway's OpenAI surface advertises
+everything it can route — 273 models — but Cursor's Agent mode and Xcode's chat
+both attach `tools` on the very first turn. A model without tool calling answers
+that turn and then stalls: it cannot call the tool, so the agent loop has
+nowhere to go. Those failures only show up after a request has been billed,
+which makes a picker full of them worse than unhelpful.
+
+Capability is not published on the OpenAI surface, so the shim joins the two
+catalogues it can reach: Gateway's **native** `/v1/models` decides membership
+(per-vendor `capabilities.supports_tool_calling`), and the **OpenAI** surface
+supplies the entries, because it is the only one keyed by `id` — the field a
+picker parses. On a typical org that is **273 → 33 models**.
+
+Two details worth knowing:
+
+- **A model qualifies if *any* vendor serving it supports tools.** Gateway
+  routes across vendors, so one capable vendor is enough, and 26 of the visible
+  models are served by more than one.
+- **Models gated behind `vendor_access_required` stay in the list, sorted last.**
+  They are one dashboard setting from working, and silently dropping every
+  Claude model would look like a bug in the shim rather than a Gateway
+  permission. They are easy to ignore at the bottom of the picker.
+
+If the capability lookup fails, the shim serves the **unfiltered** list and
+warns. A wrongly-filtered list hides models that are fine, whereas a long list
+merely annoys — so the failure mode is the harmless direction.
+
+Set `SHIM_FILTER_MODELS=0` (or `--no-model-filter`) for the raw 273.
 
 ## How the translation works
 
@@ -265,12 +292,15 @@ does not survive, the fix is a small amount of per-tool mapping in
 npm test
 ```
 
-63 checks, no network and no API key required:
+86 checks, no network and no API key required:
 
-- `scripts/translate-check.mjs` — 32 assertions over translation, idempotence,
+- `scripts/translate-check.mjs` — 33 assertions over translation, idempotence,
   and edge cases (string input, images, `developer` role, reasoning-only items,
   unsupported tools, null content)
-- `scripts/smoke.mjs` — 31 assertions against a live server: boots on an
+- `scripts/model-filter-check.mjs` — 20 assertions over catalogue filtering:
+  tool-capability membership, multi-vendor qualification, the access-gated flag,
+  ordering, and graceful degradation on malformed payloads
+- `scripts/smoke.mjs` — 33 assertions against a live server: boots on an
   ephemeral port, posts each payload shape Cursor is known to send, and checks
   classification, SSE output, error paths, and capture redaction
 
@@ -281,6 +311,7 @@ src/index.ts      CLI, argument parsing, --check
 src/config.ts     env loading and precedence, redaction
 src/shape.ts      dialect detection
 src/translate.ts  Responses → Chat Completions
+src/catalog.ts    model-catalogue filtering by capability
 src/upstream.ts   forwarding to Gateway
 src/capture.ts    capture writing
 src/reply.ts      canned replies for capture mode
@@ -308,10 +339,14 @@ entry point there.
 
 - Capture mode answers with a canned message. It verifies the protocol and lets
   Cursor proceed, but it is not a model.
-- The shim serves Chat Completions only. If a future Cursor build posts
-  Responses-shaped bodies to `/v1/responses` and parses Responses SSE, the shim
-  needs a Responses-shaped reply path.
 - Non-streaming capture replies are also canned.
+- The model filter trusts Gateway's per-vendor `supports_tool_calling` flag. A
+  model that advertises tool support but handles it unreliably will still be
+  offered.
+- Reasoning models may require the client to echo their `reasoning_content` back
+  on the following turn. DeepSeek's thinking models reject the request without
+  it (`invalid_request_error`), and that comes from the provider rather than the
+  shim. Non-reasoning models in the filtered list are unaffected.
 
 ## License
 

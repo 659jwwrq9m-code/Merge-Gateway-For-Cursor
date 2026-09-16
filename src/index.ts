@@ -34,6 +34,7 @@ Options
   --capture-dir <dir>  Where captures are written        (SHIM_CAPTURE_DIR)
   --passthrough        Forward to Gateway                (SHIM_PASSTHROUGH=1)
   --no-capture         Do not write capture files        (SHIM_CAPTURE=0)
+  --no-model-filter    Advertise every model, unfiltered  (SHIM_FILTER_MODELS=0)
   --quiet              Suppress per-request lines        (SHIM_QUIET=1)
   -h, --help           Show this help
 
@@ -70,6 +71,9 @@ function parseArgs(argv: string[]): { flags: ShimFlags; unknown: string[] } {
         break;
       case "--no-capture":
         flags.noCapture = true;
+        break;
+      case "--no-model-filter":
+        flags.noModelFilter = true;
         break;
       case "--quiet":
         flags.quiet = true;
