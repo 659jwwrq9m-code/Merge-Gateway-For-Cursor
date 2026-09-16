@@ -65,19 +65,25 @@ async function main() {
   try {
     if (!(await waitForServer())) throw new Error("shim did not start");
 
-    console.log("with SHIM_CLIENT_KEY set");
-    check("no key → 401", (await completion()).status === 401);
-    check("wrong key → 401", (await completion({ Authorization: "Bearer nope" })).status === 401);
+    // A tunnelled request looks local by *address* — cloudflared dials the shim
+    // over loopback — but carries Cloudflare's own headers, which is how the
+    // shim tells the two apart. Simulating the tunnel means simulating those
+    // headers, since that is the whole discriminator.
+    const TUNNEL = { "cf-ray": "8a1b2c3d4e5f6789-SJC", "cf-connecting-ip": "203.0.113.7" };
+
+    console.log("with SHIM_CLIENT_KEY set — tunnelled requests are gated");
+    check("no key → 401", (await completion(TUNNEL)).status === 401);
+    check("wrong key → 401", (await completion({ ...TUNNEL, Authorization: "Bearer nope" })).status === 401);
     check(
       "empty bearer → 401",
-      (await completion({ Authorization: "Bearer " })).status === 401,
+      (await completion({ ...TUNNEL, Authorization: "Bearer " })).status === 401,
     );
     check(
       "key of the right length but wrong value → 401",
-      (await completion({ Authorization: `Bearer ${"x".repeat(CLIENT_KEY.length)}` })).status === 401,
+      (await completion({ ...TUNNEL, Authorization: `Bearer ${"x".repeat(CLIENT_KEY.length)}` })).status === 401,
     );
 
-    const ok = await completion({ Authorization: `Bearer ${CLIENT_KEY}` });
+    const ok = await completion({ ...TUNNEL, Authorization: `Bearer ${CLIENT_KEY}` });
     check("correct bearer → 200", ok.status === 200, `got ${ok.status}`);
     if (ok.ok) {
       // The body above sets no `stream`, so JSON is the correct reply shape.
@@ -87,7 +93,21 @@ async function main() {
 
     check(
       "x-api-key also accepted",
-      (await completion({ "x-api-key": CLIENT_KEY })).status === 200,
+      (await completion({ ...TUNNEL, "x-api-key": CLIENT_KEY })).status === 200,
+    );
+
+    console.log("\nlocal requests are exempt, which is what lets Xcode talk to the shim");
+    // Xcode's local provider mode has nowhere obvious to put a token, and
+    // requiring one would make it and Cursor mutually exclusive on one port.
+    // Safe because a tunnelled request is never local — asserted just above.
+    check("local, no key → 200", (await completion()).status === 200);
+    check(
+      "local with x-forwarded-for is treated as tunnelled → 401",
+      (await completion({ "x-forwarded-for": "203.0.113.7" })).status === 401,
+    );
+    check(
+      "local with cf-connecting-ip is treated as tunnelled → 401",
+      (await completion({ "cf-connecting-ip": "203.0.113.7" })).status === 401,
     );
 
     console.log("\nmodel list stays open so both editors can populate their picker");
@@ -106,10 +126,17 @@ async function main() {
     // doubles the prefix against a base URL that already ends in `/v1`. Both
     // must work against the same running shim.
     check("Xcode /v1/v1/models → 200", (await fetch(`${BASE}/v1/v1/models`)).status === 200);
-    check("Xcode /v1/v1/chat/completions is not a 404", (await fetch(`${BASE}/v1/v1/chat/completions`, { method: "POST" })).status !== 404);
+    check(
+      "Xcode /v1/v1/models through a tunnel (no key) → 200",
+      (await fetch(`${BASE}/v1/v1/models`, { headers: TUNNEL })).status === 200,
+    );
+    check(
+      "Xcode /v1/v1/chat/completions is routed, not 404",
+      (await fetch(`${BASE}/v1/v1/chat/completions`, { method: "POST", headers: TUNNEL })).status === 401,
+    );
     // A leading `//` is protocol-relative per URL semantics and resolves to `/`,
-    // so it is not a path variant worth supporting — asserted only so the
-    // behaviour is deliberate rather than a surprise.
+    // so it is not a path variant worth supporting. Inner doubling is, because
+    // some clients concatenate base and path without normalising.
     check("inner doubled slash /v1//models → 200", (await fetch(`${BASE}/v1//models`)).status === 200);
 
     console.log("\nhealth stays open for probes");

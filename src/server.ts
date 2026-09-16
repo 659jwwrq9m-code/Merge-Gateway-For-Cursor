@@ -237,6 +237,36 @@ async function relayStreamReshaped(
   res.end();
 }
 
+/** Addresses that mean "something on this machine". */
+const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+
+/**
+ * Headers that mean the request arrived through something in front of the shim.
+ *
+ * `cf-ray` and `cf-connecting-ip` are Cloudflare's; `x-forwarded-for` is the
+ * generic one.
+ */
+const PROXY_HEADERS = ["cf-ray", "cf-connecting-ip", "x-forwarded-for", "x-real-ip"];
+
+/**
+ * Did this request come from this machine, rather than through a tunnel?
+ *
+ * Loopback **alone cannot answer that**: a Cloudflare tunnel dials the shim over
+ * loopback, so a request from the public internet arrives looking local by
+ * address. It does not look local by *header* — cloudflared always adds its own
+ * — and those cannot be forged by anyone outside, because the origin has no
+ * inbound port to reach. The only way in is the tunnel, which adds them.
+ *
+ * This is what lets Xcode connect locally with no key while Cursor comes through
+ * the tunnel with one, on the same port, without weakening either: the key still
+ * guards every request that is not from this machine.
+ */
+export function isLocalRequest(req: IncomingMessage): boolean {
+  const remote = req.socket.remoteAddress ?? "";
+  if (!LOOPBACK_ADDRESSES.has(remote)) return false;
+  return !PROXY_HEADERS.some((name) => req.headers[name] !== undefined);
+}
+
 /**
  * Does this request carry the configured client key?
  *
@@ -460,8 +490,27 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
     // the shim holds the real Gateway key, so without a check anyone who learns
     // the URL can spend those credits — the inbound Authorization header is not
     // forwarded upstream and is otherwise ignored.
-    if (config.clientKey && !presentsClientKey(req, config.clientKey)) {
-      warn(`rejected ${method} ${path}: missing or wrong SHIM_CLIENT_KEY`);
+    //
+    // Requests from this machine are exempt, which is what lets Xcode talk to the
+    // shim at all: it has nowhere obvious to put a token for a local provider, and
+    // requiring one would make Xcode and Cursor mutually exclusive on a single
+    // port. The exemption does not widen exposure, because a tunnelled request is
+    // never treated as local — see `isLocalRequest`.
+    if (config.clientKey && !isLocalRequest(req) && !presentsClientKey(req, config.clientKey)) {
+      // Header *names* only, never values: this is the diagnostic that tells us
+      // which field a given client actually uses, and it must stay safe to paste
+      // into a log or an issue.
+      const presented = Object.keys(req.headers)
+        .filter((name) => /auth|key|token|bearer|api/i.test(name))
+        .join(", ");
+      const via = PROXY_HEADERS.filter((name) => req.headers[name] !== undefined).join(", ");
+      warn(
+        `rejected ${method} ${path}: not local and no valid SHIM_CLIENT_KEY` +
+          ` [remote=${req.socket.remoteAddress ?? "?"}` +
+          (via ? `, proxy headers=${via}` : ", no proxy headers") +
+          `, user-agent=${String(req.headers["user-agent"] ?? "?")}]` +
+          (presented ? ` (credential-ish headers present: ${presented})` : " (no credential headers at all)"),
+      );
       sendJson(
         res,
         401,
