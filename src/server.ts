@@ -33,6 +33,7 @@ import { classifyBody, describeShape, type BodyShape } from "./shape.js";
 import { toChatCompletions } from "./translate.js";
 import { readCatalog, toOpenAIModelList, type CatalogModel } from "./catalog.js";
 import { forwardChatCompletion, forwardModels, forwardNativeModels, forwardResponses } from "./upstream.js";
+import { reshapeChunk, reshapeCompletion } from "./reshape.js";
 import { debug, info, request as logRequest, warn } from "./log.js";
 
 /** Which wire dialect the request path implies, and therefore the reply shape. */
@@ -103,9 +104,44 @@ function sendJson(res: ServerResponse, status: number, payload: string): void {
   res.end(payload);
 }
 
-/** Pipe an upstream response through, preserving status and content type. */
-async function relayResponse(res: ServerResponse, upstream: Response): Promise<void> {
+/**
+ * Pipe an upstream response through, preserving status and content type.
+ *
+ * When `reshape` is given, a successful body is rewritten on the way out into
+ * the dialect Cursor's Agent loop parses — see `reshape.ts` for why. Errors are
+ * never reshaped: a 4xx body is Gateway's own error wording and the client
+ * should see it verbatim.
+ */
+async function relayResponse(
+  res: ServerResponse,
+  upstream: Response,
+  reshape?: { model?: string },
+): Promise<void> {
   const contentType = upstream.headers.get("content-type") ?? "application/json";
+  const rewritable = reshape !== undefined && upstream.status < 400;
+
+  if (rewritable && /text\/event-stream/i.test(contentType)) {
+    if (!upstream.body) {
+      res.writeHead(upstream.status, { "Content-Type": contentType });
+      res.end();
+      return;
+    }
+    await relayStreamReshaped(res, upstream, contentType, reshape.model);
+    return;
+  }
+
+  if (rewritable && /application\/json/i.test(contentType)) {
+    const text = await upstream.text();
+    let payload = text;
+    try {
+      payload = JSON.stringify(reshapeCompletion(JSON.parse(text), reshape.model));
+    } catch {
+      // Not JSON after all — pass the original bytes through untouched.
+    }
+    sendJson(res, upstream.status, payload);
+    return;
+  }
+
   res.writeHead(upstream.status, { "Content-Type": contentType });
 
   if (!upstream.body) {
@@ -118,6 +154,87 @@ async function relayResponse(res: ServerResponse, upstream: Response): Promise<v
   const { Readable } = await import("node:stream");
   const readable = Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0]);
   readable.pipe(res);
+}
+
+/**
+ * Rewrite a chunked SSE stream, frame by frame.
+ *
+ * Frames are only ever rewritten on a complete line boundary, so a chunk split
+ * mid-JSON is held in the buffer rather than parsed half-formed. Dropped frames
+ * take their trailing blank line with them, which is what actually collapses
+ * Gateway's ~160-frame turn into something near Ollama's ~10; leaving the blank
+ * lines behind would emit a stream of empty events for no benefit.
+ *
+ * `lastDropped` is the only piece of cross-frame state, and it exists purely to
+ * pair a dropped `data:` line with the separator that follows it.
+ */
+async function relayStreamReshaped(
+  res: ServerResponse,
+  upstream: Response,
+  contentType: string,
+  model: string | undefined,
+): Promise<void> {
+  res.writeHead(upstream.status, { "Content-Type": contentType, "Cache-Control": "no-cache" });
+
+  const { Readable } = await import("node:stream");
+  const readable = Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0]);
+
+  let buffer = "";
+  let lastDropped = false;
+
+  const emit = (line: string): void => {
+    const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
+
+    if (trimmed === "") {
+      // Swallow the separator belonging to a frame we just dropped.
+      if (lastDropped) return;
+      res.write("\n");
+      return;
+    }
+
+    if (!trimmed.startsWith("data:")) {
+      res.write(`${trimmed}\n`);
+      return;
+    }
+
+    const payload = trimmed.slice(5).trim();
+    if (payload === "" || payload === "[DONE]") {
+      res.write(`${trimmed}\n`);
+      lastDropped = false;
+      return;
+    }
+
+    let next: unknown;
+    try {
+      next = reshapeChunk(JSON.parse(payload), model);
+    } catch {
+      // Unparseable frame: forward it rather than silently eating content.
+      res.write(`${trimmed}\n`);
+      lastDropped = false;
+      return;
+    }
+
+    if (next === undefined) {
+      lastDropped = true;
+      return;
+    }
+
+    res.write(`data: ${JSON.stringify(next)}\n`);
+    lastDropped = false;
+  };
+
+  for await (const chunk of readable) {
+    buffer += typeof chunk === "string" ? chunk : (chunk as Buffer).toString("utf8");
+    let newline = buffer.indexOf("\n");
+    while (newline !== -1) {
+      emit(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf("\n");
+    }
+  }
+
+  if (buffer) emit(buffer);
+  res.end();
 }
 
 /**
@@ -183,8 +300,34 @@ export function disableUnpreservableReasoning(body: unknown, config: ShimConfig)
   );
   if (!returnsToolResults) return undefined;
 
+  // Scoped to the providers that actually demand the echo, because the rewrite
+  // is not free: it suppresses reasoning on a turn where the provider would
+  // happily have produced it, and in an agent loop nearly every turn returns
+  // tool results. Applying it everywhere made reasoning effectively vanish for
+  // models that never needed it — measured on `zai/glm-5.3-flash`, which
+  // answered a tool turn fine either way and simply had its reasoning stripped.
+  const needsEcho = requiresReasoningEcho(request.model);
+  if (!needsEcho) return undefined;
+
   request.reasoning_effort = "none";
-  return "disabled reasoning for a tool-result turn, which the provider otherwise rejects";
+  return `disabled reasoning for a tool-result turn, which ${needsEcho} otherwise rejects`;
+}
+
+/**
+ * Providers that reject a tool-result follow-up unless the previous turn's
+ * reasoning is echoed back.
+ *
+ * Kept to an explicit allow-list of known offenders rather than applied
+ * globally: an unrecognised model should get its reasoning, since the failure
+ * mode for a provider that does not need the echo is only a needlessly
+ * suppressed thought, whereas disabling reasoning for one that does need it is
+ * a 400 and a looping agent. Getting it wrong in that direction is worse.
+ */
+export function requiresReasoningEcho(model: unknown): string | undefined {
+  if (typeof model !== "string") return undefined;
+  const id = model.toLowerCase();
+  if (id.includes("deepseek")) return "DeepSeek's thinking mode";
+  return undefined;
 }
 
 /** Explain a shape mismatch, which is far more common than a genuine bad request. */function dialectHint(shape: BodyShape, dialect: Dialect): string | undefined {
@@ -435,7 +578,7 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
     }
 
     if (config.passthrough) {
-      await handlePassthrough(res, outbound, seq, dialect);
+      await handlePassthrough(res, outbound, seq, dialect, pickModel(shape, config));
       return;
     }
 
@@ -447,6 +590,7 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
     outbound: unknown,
     seq: number,
     dialect: Dialect,
+    model?: string,
   ): Promise<void> {
     if (!config.apiKey) {
       warn("passthrough requested but MERGE_GATEWAY_API_KEY is not set");
@@ -471,7 +615,7 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
         return;
       }
       if (!config.quiet) logRequest(`   → forwarded to Gateway (${upstream.status})`);
-      await relayResponse(res, upstream);
+      await relayResponse(res, upstream, { model });
     } catch (error) {
       const message = (error as Error).message;
       warn(`could not reach Gateway: ${message}`);

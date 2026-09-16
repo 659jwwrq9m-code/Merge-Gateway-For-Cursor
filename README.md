@@ -212,7 +212,7 @@ shim passthrough is on: requests will be forwarded to Gateway and billed.
 | `SHIM_CAPTURE` | `1` | Write captures to disk |
 | `SHIM_PASSTHROUGH` | `0` | Forward to Gateway |
 | `SHIM_FILTER_MODELS` | `1` | Offer only models that support tool calling |
-| `SHIM_TOOL_REASONING_OFF` | `1` | Disable reasoning on tool-result turns, which some providers reject |
+| `SHIM_TOOL_REASONING_OFF` | `1` | Disable reasoning on tool-result turns for providers that reject them (DeepSeek) |
 | `SHIM_CLIENT_KEY` | — | Require this bearer token inbound. Needed when tunnelled |
 | `SHIM_MAX_BODY_BYTES` | `67108864` | Request body cap (or `SHIM_MAX_BODY_MB`) |
 | `SHIM_QUIET` | `0` | Suppress per-request lines |
@@ -228,6 +228,44 @@ Run `node dist/index.js --help` for the flag equivalents.
 | `GET` | `/v1/models` | Model list, filtered to tool-capable models |
 | `GET` | `/health` | Liveness, and which mode is active |
 | `POST` | `/v1/responses` | Responses in, Responses out — for clients that take that path |
+
+## Response translation
+
+Gateway answers `/v1/chat/completions` at `https://api-gateway.merge.dev` with
+valid OpenAI, but not the flavour Cursor's Agent loop parses. Pointed straight
+at Gateway the UI sat on *Planning next moves* then *Reconnecting* forever, with
+no error, while the identical agent flow against Ollama Cloud's OpenAI interface
+worked.
+
+**Ollama Cloud is the reference implementation here**, precisely because it
+works, and the shim normalises Gateway's frames to match. Captured side by side
+for the same request:
+
+| | Ollama Cloud (works) | Gateway (looped) |
+| --- | --- | --- |
+| Reasoning field | `delta.reasoning` | `delta.thinking` |
+| Content | `"content":""` | `"content":null` |
+| Absent fields | omitted | `tool_calls`, `annotations`, `thinking_signature` as explicit `null` |
+| Extra keys | — | `guardrails`, `routing`, `warnings` |
+| Frames per turn | ~10 | ~14, mostly no-op |
+
+The load-bearing difference is the first row. **Cursor renders `delta.reasoning`
+and ignores `delta.thinking`**, so every reasoning frame Gateway sent was
+discarded and the model appeared to be doing nothing at all. Measured on a live
+`zai/glm-5.3-flash` request: raw Gateway emitted 13 `thinking` frames and 0
+`reasoning` frames; through the shim the same request emitted 8 reasoning
+frames carrying 110 characters of real reasoning, with no `thinking` left.
+
+`reshape.ts` performs the rewrite frame by frame as the stream passes, so
+`relayResponse` no longer pipes the body blindly. It also drops frames that
+carry nothing usable, which collapses a turn to roughly Ollama's frame count,
+and restores the requested model id — Gateway answers with the bare provider id
+(`glm-5.3-flash`) where the client asked for the routed one
+(`zai/glm-5.3-flash`). Key order is set to Ollama's byte-for-byte so a client
+diffing raw frames sees no spurious change.
+
+Errors are never reshaped: a 4xx body is Gateway's own wording and is passed
+through verbatim so the real message survives.
 
 ## Reasoning models and the agent loop
 
@@ -260,6 +298,19 @@ actually returns tool results, and only when the caller has not set
 `reasoning_effort` itself. A plain chat turn, or a caller with an explicit
 reasoning preference, is left untouched, so this cannot silently degrade a
 request that would have worked. Disable with `SHIM_TOOL_REASONING_OFF=0`.
+
+The rewrite is **scoped to providers that actually demand the echo** — an
+allow-list of known offenders, currently DeepSeek's thinking models. This
+matters because the fix is not free: it suppresses reasoning the provider would
+otherwise have produced, and in an agent loop nearly every turn returns tool
+results. Applying it to every model made reasoning effectively vanish for models
+that never needed it. Measured on `zai/glm-5.3-flash`, which answers a tool turn
+fine either way and simply had its reasoning stripped; it is now left alone.
+
+An unrecognised model also keeps its reasoning, on the grounds that the two
+failure modes are not symmetric: getting it wrong for a model that does not need
+the echo costs a suppressed thought, while getting it wrong for one that does
+need it is a `400` and a looping agent.
 
 ## The model list
 
@@ -326,14 +377,18 @@ does not survive, the fix is a small amount of per-tool mapping in
 npm test
 ```
 
-86 checks, no network and no API key required:
+156 checks, no network and no API key required:
 
 - `scripts/translate-check.mjs` — 33 assertions over translation, idempotence,
   and edge cases (string input, images, `developer` role, reasoning-only items,
   unsupported tools, null content)
-- `scripts/model-filter-check.mjs` — 20 assertions over catalogue filtering:
+- `scripts/model-filter-check.mjs` — 25 assertions over catalogue filtering:
   tool-capability membership, multi-vendor qualification, the access-gated flag,
   ordering, and graceful degradation on malformed payloads
+- `scripts/response-check.mjs` — 29 assertions over response translation: the
+  `thinking` → `reasoning` rename, null-to-empty content, gateway-only key
+  stripping, no-op frame dropping, tool-call preservation, and the
+  non-streaming path
 - `scripts/smoke.mjs` — 33 assertions against a live server: boots on an
   ephemeral port, posts each payload shape Cursor is known to send, and checks
   classification, SSE output, error paths, and capture redaction
@@ -345,6 +400,7 @@ src/index.ts      CLI, argument parsing, --check
 src/config.ts     env loading and precedence, redaction
 src/shape.ts      dialect detection
 src/translate.ts  Responses → Chat Completions
+src/reshape.ts    Gateway responses → the dialect Cursor parses
 src/catalog.ts    model-catalogue filtering by capability
 src/upstream.ts   forwarding to Gateway
 src/capture.ts    capture writing
@@ -380,7 +436,17 @@ entry point there.
 - Reasoning models may require the client to echo their `reasoning_content` back
   on the following turn. DeepSeek's thinking models reject the request without
   it (`invalid_request_error`), and that comes from the provider rather than the
-  shim. Non-reasoning models in the filtered list are unaffected.
+  shim. Non-reasoning models in the filtered list are unaffected. Reasoning that
+  a provider *does* return is now surfaced to the client as `reasoning` rather
+  than dropped — see [Response translation](#response-translation).
+- `SHIM_TOOL_REASONING_OFF` works around that by disabling reasoning, which is a
+  real loss on a model whose whole value is reasoning. It now fires only for
+  providers that actually require the echo (see
+  [Reasoning models and the agent loop](#reasoning-models-and-the-agent-loop)),
+  so a model that tolerates reasoning through a tool conversation keeps it. The
+  allow-list is a hardcoded match on the model id and will not recognise a new
+  offending provider until it is added; `SHIM_TOOL_REASONING_OFF=0` disables the
+  rewrite entirely if a model is wrongly caught by it.
 
 ## License
 
