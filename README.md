@@ -300,12 +300,18 @@ The shim answers every request locally and records it.
 In Cursor:
 
 1. **Settings → Cursor Settings → Models**
-2. Enable **OpenAI API Key** — any non-empty placeholder works, because the shim
-   holds the real Gateway key. Cursor only requires that the field is filled.
+2. Enable **OpenAI API Key** — see the note below on what goes here
 3. Enable **Override OpenAI Base URL** → `http://localhost:8787/v1`
 4. Click **+ Add Custom Model** and add a Gateway model id, e.g.
    `zai/glm-5.3-flash` or `anthropic/claude-opus-5`
 5. Switch to **Agent mode** and send a message
+
+**What to put in the API key field.** If you have not set `SHIM_CLIENT_KEY`, any
+non-empty placeholder works — the shim holds the real Gateway key, and Cursor
+only requires the field to be filled. If you *have* set `SHIM_CLIENT_KEY`, this
+field must contain that exact value: it is the token the shim checks on every
+request that can reach a completion. A wrong value here produces the shim's own
+`401 invalid_api_key`, not a Gateway error.
 
 Use `localhost` rather than `127.0.0.1`. The shim binds both loopback stacks,
 and `localhost` is what Cursor and Xcode produce by default.
@@ -485,25 +491,86 @@ yields `/v1/v1/models`. Rejecting either spelling would force the two editors
 onto different ports, which is why `handle` strips a leading `/v1` (however many
 times it repeats) before routing. Doubled inner slashes are collapsed too.
 
-**The model list is readable without the key.** Both editors fetch it to populate
-their picker, and neither sends credentials for that call as reliably as it does
-for a completion — Xcode in particular offers nowhere obvious to put a token for
-it. Gating that endpoint breaks the picker while protecting nothing: it proxies a
-free, authenticated catalogue call the shim makes with its own key, so a caller
-learns model names and nothing else. It cannot spend. Every path that *can* reach
-a completion — `/v1/chat/completions` and `/v1/responses` — still requires
-`SHIM_CLIENT_KEY`.
+**Requests from this machine are exempt from the key.** This is what lets Xcode
+talk to the shim at all. Xcode's local provider mode offers nowhere to put a
+token, and requiring one would make the two editors mutually exclusive on a
+single port.
 
-The practical split, verified against one running shim:
+Loopback alone cannot establish "from this machine", because **a Cloudflare
+tunnel dials the shim over loopback** — a request from the public internet
+arrives from `127.0.0.1`. It does not look local by *header*: cloudflared always
+adds `cf-ray` and friends, and an outsider cannot forge those, because the origin
+has no inbound port. The only way in is the tunnel, which adds them. Address plus
+the absence of proxy headers is therefore a reliable local signal.
+
+Verified against one running shim:
 
 | Request | Key sent | Result |
 | --- | --- | --- |
-| `GET /v1/models` (Cursor) | no | `200` |
-| `GET /v1/v1/models` (Xcode) | no | `200` |
-| `POST /v1/chat/completions` | yes | `200` |
-| `POST /v1/chat/completions` | no or wrong | `401` |
+| `GET /v1/v1/models` (Xcode, local) | no | `200` |
+| `POST /v1/v1/chat/completions` (Xcode, local) | no | `200` |
+| `POST /v1/chat/completions` (tunnelled) | valid | `200` |
+| `POST /v1/chat/completions` (tunnelled) | none or wrong | `401` |
+| `POST /v1/chat/completions` (local, forged `x-forwarded-for`) | none | `401` |
 
+That last row is the one that matters: you cannot fake being local to skip the
+gate.
 
+## Setting up Xcode
+
+Xcode's chat provider is configured independently of Cursor, and the two use
+different provider *modes*, which is the source of the path doubling described
+above.
+
+**Before anything else**, confirm **Apple Intelligence** is enabled in
+**System Settings → Apple Intelligence & Siri**. Xcode cannot use any provider
+without it, and the failure is silent otherwise.
+
+Then in Xcode:
+
+1. **Settings → Intelligence → Add a Chat Provider**
+2. Choose **Locally Hosted**
+3. Fill in only two fields:
+
+| Field | Value |
+| --- | --- |
+| **Port** | `8787` (or whatever `SHIM_PORT` you set) |
+| **Description** | `Merge Gateway` (optional) |
+
+That is the whole form. **Locally Hosted takes only a port** — no URL, no key —
+and Xcode builds `http://localhost:8787` itself before appending `/v1/models` and
+`/v1/chat/completions`. This is why the shim binds `localhost` rather than
+`127.0.0.1`: Xcode offers no host field, and macOS resolves `localhost` to `::1`
+(IPv6) first, so an IPv4-only listener is unreachable from Xcode even though
+`curl` works.
+
+4. Pick a model from the picker, e.g. `zai/glm-5.3-flash`
+
+If the picker is empty or errors, **quit and reopen Xcode** — it caches the model
+list per provider, so a provider added while the shim was down can stay broken
+until restart.
+
+Note that listing models works even in capture mode, since it is free and spends
+nothing — but **chat only reaches Gateway once `SHIM_PASSTHROUGH=1`**. A shim left
+in the default capture mode will populate Xcode's picker and then answer chat
+messages with canned text, which reads as "the model is broken" rather than "the
+shim is not forwarding".
+
+### Internet Hosted instead
+
+If you would rather point Xcode at Gateway directly for comparison, **Internet
+Hosted** accepts a URL and a key:
+
+| Field | Value |
+| --- | --- |
+| **URL** | `https://api-gateway.merge.dev` — **no `/v1`**, Xcode appends it |
+| **Header** | `Authorization` |
+| **Key** | your Gateway key, as-is — *not* prefixed with `Bearer` |
+
+This bypasses the shim, so none of the response translation applies. It is useful
+for confirming whether a problem is the shim or the provider.
+
+## Configuration reference
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
