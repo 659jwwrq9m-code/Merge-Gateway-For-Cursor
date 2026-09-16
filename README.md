@@ -1,9 +1,15 @@
 # merge-gateway-shim
 
-A small local proxy that lets **Cursor's Agent mode** route through
-**[Merge Gateway](https://docs.merge.dev/merge-gateway/get-started)**.
+A small local proxy that lets **Cursor's Agent mode** and **Xcode's chat** route
+through **[Merge Gateway](https://docs.merge.dev/merge-gateway/get-started)**.
 
-Merge's own docs describe the problem this solves:
+Both editors can be pointed at one running shim on one port, and that is the
+case it is built for. They place different demands on it — Cursor sends a
+mismatched request dialect, Xcode sends ordinary Chat Completions and has
+nowhere to put an API key — and each was fixed in a way that would have broken
+the other if done naively.
+
+Merge's own docs describe the Cursor side of the problem this solves:
 
 > Cursor's Agent mode does not currently support custom API keys. Only Ask and
 > Plan modes work with a custom OpenAI base URL. […] This is a Cursor-side
@@ -12,10 +18,19 @@ Merge's own docs describe the problem this solves:
 The restriction is a wire-format mismatch inside Cursor's BYOK path, and it is
 fixable from the outside.
 
+- **[Setting up Cursor](#step-2--point-cursor-at-the-shim)**
+- **[Setting up Xcode](#setting-up-xcode)**
+- **[Running both at once](#serving-cursor-and-xcode-at-once)**
+
 ## The problem
 
+There are four distinct faults, and they are worth separating because two of
+them look identical from the outside and only one is Cursor's.
+
+### 1. Cursor asks in one dialect and expects the answer in another
+
 When Cursor is pointed at a custom OpenAI base URL, its Agent mode is
-self-inconsistent about dialects:
+self-inconsistent:
 
 | Layer | What Cursor uses |
 | --- | --- |
@@ -23,7 +38,7 @@ self-inconsistent about dialects:
 | Request body | **Responses** shape — `input[]`, flat `tools[]`, `reasoning`, `text`, `include`, `store` |
 | Response parser | **Chat Completions** SSE — `choices[].delta`, `finish_reason` |
 
-So it asks in one dialect and expects the answer in another. Three consequences:
+Three consequences:
 
 - A strict Chat Completions upstream rejects the body with
   `Missing required parameter: 'messages'`.
@@ -41,29 +56,60 @@ matters because Gateway ids are `provider/model`.
 Cursor sometimes mixes shapes in a single request: a Chat Completions top level
 carrying one stray `type:"custom"` tool.
 
+### 2. Gateway answers in a dialect Cursor does not render
+
+This one affects every client and is the reason Agent mode sat on *Planning next
+moves* → *Reconnecting* forever with no error shown. Gateway names the reasoning
+field `delta.thinking`; Cursor renders `delta.reasoning` and ignores the rest, so
+the entire reasoning phase was discarded and the model looked like it was doing
+nothing. See [Response translation](#response-translation).
+
+### 3. A reasoning turn that cannot be replayed
+
+Some providers reject the second turn of a tool conversation unless the previous
+turn's reasoning is echoed back, which agent clients do not preserve. That is a
+`400` and a retry loop. See
+[Reasoning models and the agent loop](#reasoning-models-and-the-agent-loop).
+
+### 4. One port, two clients that disagree about paths and keys
+
+Xcode's local provider mode has nowhere to put an API key, and builds its own
+`/v1` prefix; Cursor takes the base URL verbatim and does send a key. Requiring
+the key everywhere locks Xcode out; not requiring it leaves a tunnel open. See
+[Serving Cursor and Xcode at once](#serving-cursor-and-xcode-at-once).
+
 ## The fix
 
 ```
-Cursor (Agent mode)
-   │  POST /v1/chat/completions        body: Responses-shaped
-   ▼
-merge-gateway-shim  (localhost:8787)
-   │  1. classify the body
-   │  2. capture it to disk (credentials redacted)
-   │  3. normalise → strict Chat Completions
-   ▼
-Merge Gateway   /v1/openai/chat/completions
-   │  standard OpenAI SSE
-   ▼
-merge-gateway-shim
-   │  4. pass SSE straight back, no buffering
-   ▼
-Cursor  ✓ renders, calls tools, applies edits
+        Cursor (Agent mode)              Xcode (chat)
+   request:  Responses-shaped        request:  Chat Completions
+   path:     /v1/chat/completions    path:     /v1/v1/chat/completions
+   key:      sent                    key:      none available
+                     │                          │
+                     └────────────┬─────────────┘
+                                  ▼
+                    merge-gateway-shim  (localhost:8787)
+                     1. classify the body
+                     2. capture it to disk (credentials redacted)
+                     3. normalise → strict Chat Completions
+                     4. exempt local requests from the client key
+                                  │
+                                  ▼
+                Merge Gateway   /v1/openai/chat/completions
+                                  │  standard OpenAI SSE
+                                  ▼
+                    merge-gateway-shim
+                     5. reshape the response for Cursor
+                        (thinking → reasoning, drop no-ops)
+                                  │
+                                  ▼
+              Cursor  ✓ renders reasoning, calls tools, applies edits
+              Xcode   ✓ renders, calls tools
 ```
 
 Normalising **down** to Chat Completions is deliberate: Gateway's OpenAI surface
 is its best-tested path, so routing, failover, budgets, and cost attribution all
-keep working, and the response side needs no translation at all.
+keep working, and only one dialect has to be understood.
 
 Gateway already exposes both dialects, so nothing is needed from Merge:
 
@@ -73,13 +119,21 @@ POST /v1/openai/responses          OpenAI-shaped Responses
 POST /v1/responses                 Gateway-native Responses
 ```
 
+
 ## Requirements
 
 - Node.js 20.12+ (uses `process.loadEnvFile`; older runtimes fall back to a
   built-in parser)
 - A Merge Gateway API key from [dashboard.merge.dev](https://dashboard.merge.dev)
-- Cursor, with Agent mode — [download](https://cursor.com/downloads) (macOS,
-  Windows, and Linux)
+- At least one of:
+  - **Cursor**, with Agent mode — [download](https://cursor.com/downloads)
+    (macOS, Windows, and Linux)
+  - **Xcode**, for its chat provider — see [Setting up Xcode](#setting-up-xcode)
+
+Both editors can share one shim, so install both if you want. Xcode additionally
+requires **Apple Intelligence** enabled in
+**System Settings → Apple Intelligence & Siri**; without it Xcode cannot use any
+provider, and it fails quietly.
 
 ## Install
 
@@ -262,7 +316,7 @@ rest of this document assumes PowerShell.
 The simplest path on every platform is to put the setting in `.env` and leave
 shell variables alone.
 
-## Step 1 — survey Cursor's traffic
+## Step 1 — survey the traffic (capture mode)
 
 **Capture mode is the default.** The shim records every request and answers
 locally without ever contacting Gateway, so you can survey traffic without
@@ -328,9 +382,13 @@ Cursor rewrites a custom model id that collides with a name in its own catalogue
 `provider/model`, which do not collide, so **always use the full
 `provider/model` form** and you will not hit it.
 
+If you also want Xcode pointed at this shim, **stop here and do
+[Setting up Xcode](#setting-up-xcode) first** — it needs the shim running in
+passthrough, but it needs none of the Cursor fields above.
+
 ## Step 3 — turn on passthrough
 
-Once Cursor is talking to the shim, forward to Gateway:
+Once an editor is talking to the shim, forward to Gateway:
 
 ```sh
 SHIM_PASSTHROUGH=1 npm start
