@@ -473,7 +473,37 @@ Two caveats on quick tunnels:
 - **Quick tunnels are public.** Anyone who learns the URL can reach the shim.
   `SHIM_CLIENT_KEY` is what stops them getting further.
 
-## Configuration reference
+## Serving Cursor and Xcode at once
+
+One shim serves both editors simultaneously. That constraint shapes two details,
+and both are easy to break by "fixing" one client at the other's expense.
+
+**Paths are matched by suffix, not exactly.** Cursor takes its base URL verbatim,
+so `http://localhost:8787/v1` yields `/v1/models`. Xcode's provider field holds a
+host with no `/v1` in it and Xcode appends one itself, so the *same* base URL
+yields `/v1/v1/models`. Rejecting either spelling would force the two editors
+onto different ports, which is why `handle` strips a leading `/v1` (however many
+times it repeats) before routing. Doubled inner slashes are collapsed too.
+
+**The model list is readable without the key.** Both editors fetch it to populate
+their picker, and neither sends credentials for that call as reliably as it does
+for a completion — Xcode in particular offers nowhere obvious to put a token for
+it. Gating that endpoint breaks the picker while protecting nothing: it proxies a
+free, authenticated catalogue call the shim makes with its own key, so a caller
+learns model names and nothing else. It cannot spend. Every path that *can* reach
+a completion — `/v1/chat/completions` and `/v1/responses` — still requires
+`SHIM_CLIENT_KEY`.
+
+The practical split, verified against one running shim:
+
+| Request | Key sent | Result |
+| --- | --- | --- |
+| `GET /v1/models` (Cursor) | no | `200` |
+| `GET /v1/v1/models` (Xcode) | no | `200` |
+| `POST /v1/chat/completions` | yes | `200` |
+| `POST /v1/chat/completions` | no or wrong | `401` |
+
+
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -488,7 +518,7 @@ Two caveats on quick tunnels:
 | `SHIM_PASSTHROUGH` | `0` | Forward to Gateway |
 | `SHIM_FILTER_MODELS` | `1` | Offer only models that support tool calling |
 | `SHIM_TOOL_REASONING_OFF` | `1` | Disable reasoning on tool-result turns for providers that reject them (DeepSeek) |
-| `SHIM_CLIENT_KEY` | — | Require this bearer token inbound. Needed when tunnelled |
+| `SHIM_CLIENT_KEY` | — | Require this bearer token inbound, on every path that can spend Gateway credit |
 | `SHIM_MAX_BODY_BYTES` | `67108864` | Request body cap (or `SHIM_MAX_BODY_MB`) |
 | `SHIM_QUIET` | `0` | Suppress per-request lines |
 | `SHIM_DEBUG` | — | Verbose translation diagnostics |

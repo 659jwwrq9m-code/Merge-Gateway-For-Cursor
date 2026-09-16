@@ -90,12 +90,27 @@ async function main() {
       (await completion({ "x-api-key": CLIENT_KEY })).status === 200,
     );
 
-    console.log("\nmodel list is gated too");
-    check("models without key → 401", (await fetch(`${BASE}/v1/models`)).status === 401);
+    console.log("\nmodel list stays open so both editors can populate their picker");
+    // Deliberate: Xcode has nowhere obvious to put a token for this call, and
+    // the endpoint proxies a free Gateway catalogue call the shim makes itself,
+    // so it cannot spend anything. Gating it breaks Xcode's model fetch while
+    // protecting nothing.
+    check("models without key → 200", (await fetch(`${BASE}/v1/models`)).status === 200);
     check(
       "models with key → 200",
       (await fetch(`${BASE}/v1/models`, { headers: { Authorization: `Bearer ${CLIENT_KEY}` } })).status === 200,
     );
+
+    console.log("\npath variants the two editors produce both resolve");
+    // Cursor sends the base URL verbatim; Xcode appends its own `/v1`, which
+    // doubles the prefix against a base URL that already ends in `/v1`. Both
+    // must work against the same running shim.
+    check("Xcode /v1/v1/models → 200", (await fetch(`${BASE}/v1/v1/models`)).status === 200);
+    check("Xcode /v1/v1/chat/completions is not a 404", (await fetch(`${BASE}/v1/v1/chat/completions`, { method: "POST" })).status !== 404);
+    // A leading `//` is protocol-relative per URL semantics and resolves to `/`,
+    // so it is not a path variant worth supporting — asserted only so the
+    // behaviour is deliberate rather than a surprise.
+    check("inner doubled slash /v1//models → 200", (await fetch(`${BASE}/v1//models`)).status === 200);
 
     console.log("\nhealth stays open for probes");
     const health = await fetch(`${BASE}/health`);

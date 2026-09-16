@@ -430,13 +430,36 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
       return;
     }
 
+    // A prefix-tolerant view of the path, so the same route can be reached at
+    // the names different clients actually construct.
+    //
+    // Xcode's provider field holds a host with no `/v1` in it and Xcode appends
+    // one itself, so a base URL of `http://localhost:8899/v1` produces requests
+    // for `/v1/v1/models`. Cursor does the opposite and takes the base URL
+    // verbatim. Matching the suffix rather than the whole path serves both at
+    // once instead of forcing one client to change to suit the other, which
+    // would mean the two could never be pointed at the same shim.
+    const route = path.replace(/\/{2,}/g, "/").replace(/\/+$/, "").replace(/^(?:\/v1)+(?=\/|$)/, "");
+    const isModels = route === "/models";
+
+    // The model list is deliberately readable without the key.
+    //
+    // Both editors fetch it to populate their picker, and neither sends
+    // credentials for that call as reliably as it does for a completion — Xcode
+    // in particular offers nowhere obvious to put one. Gating it therefore
+    // breaks the picker while protecting nothing: the endpoint proxies Gateway's
+    // catalogue, which is a free, authenticated call the shim makes with its own
+    // key, so a caller learns the model names and nothing else. It cannot spend
+    // anything. The key still gates every path that can reach a completion.
+    if (isModels) {
+      await handleModels(res);
+      return;
+    }
+
     // Gate everything that can reach Gateway. A tunnel makes this URL public, and
     // the shim holds the real Gateway key, so without a check anyone who learns
     // the URL can spend those credits — the inbound Authorization header is not
     // forwarded upstream and is otherwise ignored.
-    //
-    // /health stays open so a tunnel or uptime probe can verify liveness without
-    // holding the secret.
     if (config.clientKey && !presentsClientKey(req, config.clientKey)) {
       warn(`rejected ${method} ${path}: missing or wrong SHIM_CLIENT_KEY`);
       sendJson(
@@ -450,15 +473,9 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
       return;
     }
 
-    // Cursor's "Verify" step, and its model picker, hit the models endpoint.
-    if (path === "/v1/models" || path === "/models") {
-      await handleModels(res);
-      return;
-    }
-
-    const dialect: Dialect | undefined = path.endsWith("/chat/completions")
+    const dialect: Dialect | undefined = route.endsWith("/chat/completions")
       ? "chat_completions"
-      : path.endsWith("/responses")
+      : route.endsWith("/responses")
         ? "responses"
         : undefined;
 
