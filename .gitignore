@@ -10,3 +10,9 @@ dist/
 
 # Captured Cursor traffic is diagnostic output, not source.
 captures/
+
+# A parallel capture-only prototype, kept for reference but not shipped.
+prototype-recon/
+
+# macOS
+.DS_Store
