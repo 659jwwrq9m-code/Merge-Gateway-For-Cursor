@@ -1,0 +1,32 @@
+{
+  "name": "merge-gateway-shim",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Wire-format shim between Cursor's OpenAI base URL override and Merge Gateway, so Agent mode can route through Gateway.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check:env": "npm run build --silent && node dist/index.js --check",
+    "test": "npm run build --silent && node scripts/translate-check.mjs && node scripts/smoke.mjs"
+  },
+  "keywords": [
+    "cursor",
+    "merge-gateway",
+    "byok",
+    "openai-compatible",
+    "responses-api",
+    "wire-format"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
+  }
+}

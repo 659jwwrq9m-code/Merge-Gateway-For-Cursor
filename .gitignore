@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# Environment files hold API keys and must never be committed.
+.env
+.env.*
+!.env.example
+
+# Captured Cursor traffic is diagnostic output, not source.
+captures/
