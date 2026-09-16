@@ -212,6 +212,8 @@ shim passthrough is on: requests will be forwarded to Gateway and billed.
 | `SHIM_CAPTURE` | `1` | Write captures to disk |
 | `SHIM_PASSTHROUGH` | `0` | Forward to Gateway |
 | `SHIM_FILTER_MODELS` | `1` | Offer only models that support tool calling |
+| `SHIM_TOOL_REASONING_OFF` | `1` | Disable reasoning on tool-result turns, which some providers reject |
+| `SHIM_CLIENT_KEY` | — | Require this bearer token inbound. Needed when tunnelled |
 | `SHIM_MAX_BODY_BYTES` | `67108864` | Request body cap (or `SHIM_MAX_BODY_MB`) |
 | `SHIM_QUIET` | `0` | Suppress per-request lines |
 | `SHIM_DEBUG` | — | Verbose translation diagnostics |
@@ -226,6 +228,38 @@ Run `node dist/index.js --help` for the flag equivalents.
 | `GET` | `/v1/models` | Model list, filtered to tool-capable models |
 | `GET` | `/health` | Liveness, and which mode is active |
 | `POST` | `/v1/responses` | Responses in, Responses out — for clients that take that path |
+
+## Reasoning models and the agent loop
+
+Some providers reject the **second** turn of a tool conversation. DeepSeek's
+thinking mode, through Gateway, returns:
+
+```
+The `reasoning_content` in the thinking mode must be passed back to the API.
+```
+
+It requires the previous turn's reasoning to be echoed back verbatim. Agent
+clients — Cursor included — do not preserve that field, so the turn fails, the
+client retries the same conversation, and the UI loops on *Planning next moves*
+→ *Reconnecting* with no error shown. Pointing a client straight at Gateway
+reproduces it exactly, which is the tell that it is provider behaviour and not
+the shim.
+
+Measured against Gateway directly:
+
+| Follow-up payload | Result |
+| --- | --- |
+| nothing added | `400` |
+| `reasoning_content: ""` | `400` |
+| `reasoning_content: "x"` | `400` |
+| **`reasoning_effort: "none"`** | **`200`** |
+
+Sending a fabricated `reasoning_content` does not satisfy the provider, so the
+shim sets `reasoning_effort: "none"` instead — but only on a request that
+actually returns tool results, and only when the caller has not set
+`reasoning_effort` itself. A plain chat turn, or a caller with an explicit
+reasoning preference, is left untouched, so this cannot silently degrade a
+request that would have worked. Disable with `SHIM_TOOL_REASONING_OFF=0`.
 
 ## The model list
 

@@ -164,6 +164,15 @@ export interface ShimConfig {
    * credits, and the inbound Authorization header is otherwise ignored.
    */
   clientKey?: string;
+  /**
+   * Disable provider reasoning on tool-result turns.
+   *
+   * Providers such as DeepSeek's thinking mode reject a follow-up tool turn
+   * unless the previous turn's `reasoning_content` is echoed back, and agent
+   * clients do not preserve it — so the turn 400s and the client retries forever.
+   * On by default because the alternative is a broken agent loop.
+   */
+  forceToolReasoningOff: boolean;
   /** Cap on buffered request bodies, in bytes. */
   maxBodyBytes: number;
   /**
@@ -291,6 +300,7 @@ export function resolveConfig(
     ),
     filterModels: flags.noModelFilter ? false : asBool(env.SHIM_FILTER_MODELS, true),
     clientKey: env.SHIM_CLIENT_KEY?.trim() || undefined,
+    forceToolReasoningOff: asBool(env.SHIM_TOOL_REASONING_OFF, true),
     quiet: flags.quiet ?? asBool(env.SHIM_QUIET, false),
   };
 }

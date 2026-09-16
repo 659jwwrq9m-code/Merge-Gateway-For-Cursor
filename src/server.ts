@@ -146,6 +146,47 @@ function presentsClientKey(req: IncomingMessage, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
+/**
+ * Turn off reasoning for requests whose conversation cannot carry it back.
+ *
+ * Some providers reject a follow-up turn of a tool conversation unless the
+ * previous turn's `reasoning_content` is returned verbatim — DeepSeek's thinking
+ * mode does this through Gateway, with `invalid_request_error`. Agent clients
+ * generally do not preserve that field, so the turn fails and the client retries
+ * the same conversation forever.
+ *
+ * The check is deliberately narrow: only when the request actually carries tool
+ * results, and only when the client has not asked for reasoning itself. A plain
+ * chat turn keeps whatever reasoning the caller wanted, so this cannot silently
+ * degrade a request that would have worked.
+ *
+ * `reasoning_effort: "none"` is what satisfies the provider; sending a fabricated
+ * `reasoning_content` does not, which was measured against Gateway directly.
+ */
+export function disableUnpreservableReasoning(body: unknown, config: ShimConfig): string | undefined {
+  if (!config.forceToolReasoningOff) return undefined;
+  if (typeof body !== "object" || body === null) return undefined;
+
+  const request = body as Record<string, unknown>;
+  // A caller who set reasoning_effort chose it deliberately; leave it alone.
+  // Already-"none" needs no rewrite either, so this is a genuine no-op then.
+  if (request.reasoning_effort !== undefined) return undefined;
+
+  const messages = request.messages;
+  if (!Array.isArray(messages)) return undefined;
+
+  // Only the turn that returns tool results is at risk: that is the shape the
+  // provider refuses without the prior reasoning.
+  const returnsToolResults = messages.some(
+    (message) =>
+      typeof message === "object" && message !== null && (message as { role?: unknown }).role === "tool",
+  );
+  if (!returnsToolResults) return undefined;
+
+  request.reasoning_effort = "none";
+  return "disabled reasoning for a tool-result turn, which the provider otherwise rejects";
+}
+
 /** Explain a shape mismatch, which is far more common than a genuine bad request. */function dialectHint(shape: BodyShape, dialect: Dialect): string | undefined {
   const path = dialect === "responses" ? "/v1/responses" : "/v1/chat/completions";
   const needed = dialect === "responses" ? "input" : "messages";
@@ -367,6 +408,20 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
     if (dialect !== "responses") {
       ({ body: outbound, notes } = toChatCompletions(body));
       if (notes.length > 0) debug(`translate: ${notes.join("; ")}`);
+    }
+
+    // Reasoning models on some providers (DeepSeek's thinking mode, via Gateway)
+    // reject a multi-turn tool conversation unless the previous turn's reasoning
+    // is echoed back verbatim as `reasoning_content`. Cursor cannot preserve it,
+    // so the second request of any tool conversation would 400 — which surfaces
+    // in the client as an endless "reconnecting" loop, not as an error.
+    //
+    // Disabling reasoning for these requests is the workable fix: the model
+    // answers with tool calls as usual, and the agent loop completes.
+    const reasoningNote = disableUnpreservableReasoning(outbound, config);
+    if (reasoningNote) {
+      notes = [...notes, reasoningNote];
+      debug(`reasoning: ${reasoningNote}`);
     }
 
     // Only now, with translation attempted, is a shape mismatch worth naming: it
