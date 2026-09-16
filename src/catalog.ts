@@ -1,23 +1,33 @@
 /**
  * Model-catalogue shaping for client pickers.
  *
- * Gateway's OpenAI surface advertises everything it can route — 273 models —
- * but Cursor's Agent mode and Xcode's chat both send `tools` on the very first
- * turn. A model without tool calling answers that turn and then stalls: it has
- * no way to call the tool, so the agent loop has nowhere to go. Listing those
- * models is worse than omitting them, because the failure only appears after a
- * request has been billed.
+ * Gateway's OpenAI surface (`/v1/openai/models`) and its native catalogue
+ * (`/v1/models`) disagree, and neither is sufficient alone:
  *
- * Capability is not on the OpenAI surface. It lives on Gateway's *native*
- * `/v1/models`, per vendor, as `capabilities.supports_tool_calling`. So the two
- * lists are joined: the native catalogue decides membership, and the OpenAI
- * surface supplies the entries — it is the only one keyed by `id`, which is the
- * field a picker actually parses.
+ *   - Capability is published only on the **native** catalogue, per vendor, as
+ *     `capabilities.supports_tool_calling`.
+ *   - The **native** catalogue has 289 models; the OpenAI surface lists 273, so
+ *     16 routable models are missing from it.
+ *   - 67 OpenAI-family models appear on the surface *unprefixed* (`gpt-5.5`)
+ *     while the native catalogue calls them `openai/gpt-5.5`. Those prefixes are
+ *     interchangeable at the endpoint — both routable — but an id copied from
+ *     one list can be absent from the other, which silently drops models.
+ *
+ * So the native catalogue is the single source of truth, and entries are
+ * rendered into the OpenAI shape a picker expects. That keeps one authoritative
+ * list rather than intersecting two that disagree.
+ *
+ * The filter matters because Cursor's Agent mode and Xcode's chat both send
+ * `tools` on the very first turn. A model without tool calling answers that turn
+ * and then stalls: it cannot call the tool, so the agent loop has nowhere to go,
+ * and the failure only appears after the request has been billed.
  */
 
 /** A model reduced to what a picker needs to decide whether to show it. */
 export interface CatalogModel {
   id: string;
+  displayName: string;
+  provider: string;
   /**
    * Gateway can route it, but the organisation's vendor access has not been
    * granted, so a request would be rejected.
@@ -29,14 +39,16 @@ export interface CatalogModel {
   accessRequired: boolean;
 }
 
-interface NativeVendor {
-  capabilities?: { supports_tool_calling?: boolean } | null;
+/** An entry in the OpenAI `list` shape a model picker parses. */
+export interface OpenAIModelEntry {
+  id: string;
+  object: "model";
+  created: number;
+  owned_by: string;
 }
 
-interface NativeModel {
-  model?: unknown;
-  access_required?: unknown;
-  vendors?: Record<string, NativeVendor> | null;
+interface NativeVendor {
+  capabilities?: { supports_tool_calling?: boolean } | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -44,64 +56,80 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Read Gateway's native `/v1/models` payload into the models a client can
- * actually drive.
+ * Ask for the whole catalogue in one request.
+ *
+ * The endpoint honours `limit` well above the catalogue size, so a single call
+ * returns everything with `has_more: false`. No cursor walk is needed; the
+ * request is a fixed, small cost on the model-list path.
+ */
+export const CATALOG_LIMIT = 500;
+
+/**
+ * Read Gateway's native catalogue into the models a client can actually drive.
  *
  * A model counts as tool-capable when *any* vendor serving it supports tool
  * calling. That is the right test because Gateway routes across vendors, so one
- * capable vendor is enough for the request to succeed, and 26 of the visible
- * models are served by more than one.
+ * capable vendor is enough for the request to succeed, and many models are
+ * served by more than one.
  *
  * An unrecognisable payload yields an empty list. Callers treat that as "no
  * capability information" rather than "no models", so a Gateway schema change
  * degrades to an unfiltered list instead of an empty picker.
  */
-export function readToolCapable(payload: unknown): CatalogModel[] {
+export function readCatalog(payload: unknown): CatalogModel[] {
   const data = isRecord(payload) ? payload.data : undefined;
   if (!Array.isArray(data)) return [];
 
   const models: CatalogModel[] = [];
+  const seen = new Set<string>();
+
   for (const entry of data) {
     if (!isRecord(entry)) continue;
+    if (typeof entry.model !== "string" || entry.model.length === 0) continue;
+    if (seen.has(entry.model)) continue;
 
-    const native = entry as NativeModel;
-    if (typeof native.model !== "string" || native.model.length === 0) continue;
-
-    const vendors = native.vendors;
+    const vendors = entry.vendors;
     if (!isRecord(vendors)) continue;
 
     const capable = Object.values(vendors).some(
-      (vendor) => vendor?.capabilities?.supports_tool_calling === true,
+      (vendor) => (vendor as NativeVendor | null)?.capabilities?.supports_tool_calling === true,
     );
     if (!capable) continue;
 
-    models.push({ id: native.model, accessRequired: native.access_required === true });
+    seen.add(entry.model);
+    models.push({
+      id: entry.model,
+      displayName: typeof entry.display_name === "string" ? entry.display_name : entry.model,
+      provider: typeof entry.provider === "string" ? entry.provider : "merge-gateway",
+      accessRequired: entry.access_required === true,
+    });
   }
 
   return models;
 }
 
 /**
- * Drop models that cannot call tools, then order the rest for a picker.
+ * Render the catalogue as an OpenAI `list` for a model picker.
  *
- * Ordering is: everything usable first, alphabetically, then the access-gated
- * models. `access_required` models are not errors to hide — they are just not
- * the ones to reach for by default, and a picker lists in order.
+ * Ordered so everything usable comes first, alphabetically, then the
+ * access-gated models. `access_required` models are not errors to hide — they
+ * are just not the ones to reach for by default, and a picker lists in order.
  *
- * Ids absent from `catalog` are dropped. The OpenAI surface and the native
- * catalogue agreed on every tool-capable id when this was written, so a miss
- * means the two drifted, and omitting an unknown-capability model is the
- * conservative choice.
+ * `created` is 0 because Gateway publishes no creation time on the native
+ * catalogue (`created_at` is null for every record). Pickers treat it as
+ * informational and no client has been observed to sort on it; a fabricated
+ * timestamp would be worse than an obviously absent one.
  */
-export function orderForPicker<T extends { id: string }>(models: T[], catalog: CatalogModel[]): T[] {
-  const byId = new Map(catalog.map((model) => [model.id, model]));
-
-  return models
-    .filter((model) => byId.has(model.id))
+export function toOpenAIModelList(catalog: CatalogModel[]): OpenAIModelEntry[] {
+  return [...catalog]
     .sort((a, b) => {
-      const aGated = byId.get(a.id)?.accessRequired === true ? 1 : 0;
-      const bGated = byId.get(b.id)?.accessRequired === true ? 1 : 0;
-      if (aGated !== bGated) return aGated - bGated;
+      if (a.accessRequired !== b.accessRequired) return a.accessRequired ? 1 : -1;
       return a.id.localeCompare(b.id);
-    });
+    })
+    .map((model) => ({
+      id: model.id,
+      object: "model" as const,
+      created: 0,
+      owned_by: model.provider,
+    }));
 }

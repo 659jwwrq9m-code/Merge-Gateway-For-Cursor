@@ -11,6 +11,7 @@
  */
 
 import { debug } from "./log.js";
+import { CATALOG_LIMIT } from "./catalog.js";
 import type { ShimConfig } from "./config.js";
 
 export interface ForwardOptions {
@@ -92,10 +93,13 @@ export async function forwardModels(config: ShimConfig): Promise<Response> {
  * URL rather than configured separately: `/v1/openai` is a surface mounted on
  * the same host, so stripping it lands on the native root. Keeping it derived
  * means one setting still points the shim at Gateway.
+ *
+ * `limit` is set well above the catalogue size so one call returns everything
+ * with `has_more: false` — no cursor walk.
  */
 export async function forwardNativeModels(config: ShimConfig): Promise<Response> {
   const root = config.gatewayBaseUrl.replace(/\/openai\/?$/, "");
-  const url = joinUrl(root, "models");
+  const url = joinUrl(root, `models?limit=${CATALOG_LIMIT}`);
   const headers: Record<string, string> = { Accept: "application/json" };
   if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
   return fetch(url, { method: "GET", headers });

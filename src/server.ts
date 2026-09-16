@@ -30,8 +30,8 @@ import { errorBody, jsonCompletion, jsonResponse, sseCompletion, sseResponse } f
 import type { ShimConfig } from "./config.js";
 import { classifyBody, describeShape, type BodyShape } from "./shape.js";
 import { toChatCompletions } from "./translate.js";
+import { readCatalog, toOpenAIModelList, type CatalogModel } from "./catalog.js";
 import { forwardChatCompletion, forwardModels, forwardNativeModels, forwardResponses } from "./upstream.js";
-import { orderForPicker, readToolCapable } from "./catalog.js";
 import { debug, info, request as logRequest, warn } from "./log.js";
 
 /** Which wire dialect the request path implies, and therefore the reply shape. */
@@ -41,6 +41,16 @@ interface ReadResult {
   raw: Buffer;
   text: string;
   truncated: boolean;
+}
+
+/**
+ * Process-lifetime memo for the model catalogue.
+ *
+ * Held by closure rather than a module global so tests can spin up independent
+ * servers, and so a restart is always a clean read.
+ */
+interface CatalogCache {
+  catalog?: CatalogModel[];
 }
 
 /**
@@ -127,33 +137,52 @@ export function createShimServer(config: ShimConfig): Server {
 }
 
 /**
- * Reduce the advertised catalogue to models that can actually call tools.
+ * Build the advertised catalogue from Gateway's native models endpoint.
  *
- * Returns undefined when capability could not be determined, so the caller can
- * fall back to the unfiltered list rather than presenting an empty picker.
+ * Returns undefined when the catalogue could not be read, so the caller can fall
+ * back rather than presenting an empty picker.
  *
- * One extra upstream call, on the `GET /models` path only — a picker refresh or
- * a provider "Verify" click. Completions never come through here, so the cost
- * sits outside the agent loop entirely.
+ * One upstream call, on the `GET /models` path only — a picker refresh or a
+ * provider "Verify" click. Completions never come through here, so the cost sits
+ * outside the agent loop entirely.
  */
-async function filterToToolCapable(config: ShimConfig, entries: unknown[]): Promise<unknown[] | undefined> {
-  try {
-    const native = await forwardNativeModels(config);
-    if (!native.ok) return undefined;
-
-    const catalog = readToolCapable(await native.json());
-    if (catalog.length === 0) return undefined;
-
-    return orderForPicker(
-      entries.filter(
-        (entry): entry is { id: string } =>
-          typeof entry === "object" && entry !== null && typeof (entry as { id?: unknown }).id === "string",
-      ),
-      catalog,
-    );
-  } catch {
+async function buildCatalog(config: ShimConfig): Promise<CatalogModel[] | undefined> {
+  const native = await forwardNativeModels(config);
+  if (!native.ok) {
+    warn(`Gateway returned ${native.status} for the native catalogue`);
     return undefined;
   }
+
+  const catalog = readCatalog(await native.json());
+  return catalog.length > 0 ? catalog : undefined;
+}
+
+/**
+ * Serve the model list a picker should see.
+ *
+ * The native catalogue is the source of truth (see `catalog.ts` for why the
+ * OpenAI surface is not), so this does not proxy it through. The result is
+ * cached for the process lifetime: the catalogue holds a few hundred entries and
+ * changes on the order of releases, not seconds, while a picker refresh or a
+ * provider "Verify" click hits this path repeatedly.
+ */
+async function serveCatalog(res: ServerResponse, cache: CatalogCache, config: ShimConfig): Promise<void> {
+  const catalog = cache.catalog ?? (await buildCatalog(config).catch(() => undefined));
+  if (catalog) {
+    cache.catalog = catalog;
+    sendJson(res, 200, JSON.stringify({ object: "list", data: toOpenAIModelList(catalog) }));
+    return;
+  }
+
+  // A minimal but correctly-shaped list, so a picker still populates.
+  warn("could not read the Gateway catalogue; serving a stub instead");
+  const models = [config.defaultModel ?? "anthropic/claude-opus-5"].map((id) => ({
+    id,
+    object: "model",
+    created: 0,
+    owned_by: "merge-gateway",
+  }));
+  sendJson(res, 200, JSON.stringify({ object: "list", data: models }));
 }
 
 /**
@@ -164,6 +193,7 @@ async function filterToToolCapable(config: ShimConfig, entries: unknown[]): Prom
  */
 function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: ServerResponse) => void {
   const capture = new Capture(config.captureDir);
+  const catalogCache: CatalogCache = {};
 
   return (req, res) => {
     void handle(req, res).catch((error: unknown) => {
@@ -211,51 +241,22 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
   }
 
   async function handleModels(res: ServerResponse): Promise<void> {
-    // Gateway's /v1/openai/models is a free, authenticated call, so the real
-    // catalogue is proxied whenever a key is available — even in capture mode,
-    // which never spends anything. This matters for clients that validate a
-    // provider by listing its models first: Xcode refuses to add a provider
-    // whose model list it cannot parse.
-    //
-    // Gateway's *native* /v1/models is not usable for that, because entries key
-    // the id as `model` rather than OpenAI's `id`. Hence /v1/openai/models.
-    if (config.apiKey) {
+    // Unfiltered mode proxies Gateway's OpenAI surface directly, which is the
+    // list this shim would otherwise have to reproduce.
+    if (!config.filterModels && config.apiKey) {
       try {
         const upstream = await forwardModels(config);
         if (upstream.ok) {
-          if (!config.filterModels) {
-            await relayResponse(res, upstream);
-            return;
-          }
-
-          const payload = (await upstream.json()) as { data?: unknown[] };
-          const entries = Array.isArray(payload.data) ? payload.data : [];
-          const filtered = await filterToToolCapable(config, entries);
-          if (filtered) {
-            sendJson(res, 200, JSON.stringify({ object: "list", data: filtered }));
-            return;
-          }
-
-          // Capability lookup failed. An unfiltered list still works, whereas a
-          // wrongly-filtered one hides models that are fine, so keep what we have.
-          warn("capability lookup failed; serving the unfiltered model list");
-          sendJson(res, 200, JSON.stringify({ object: "list", data: entries }));
+          await relayResponse(res, upstream);
           return;
         }
-        warn(`Gateway returned ${upstream.status} for the model list; serving a stub instead`);
+        warn(`Gateway returned ${upstream.status} for the model list; falling back to the catalogue`);
       } catch (error) {
         warn(`could not fetch the model list: ${(error as Error).message}`);
       }
     }
 
-    // A minimal but correctly-shaped list, so a picker still populates.
-    const models = [config.defaultModel ?? "anthropic/claude-opus-5"].map((id) => ({
-      id,
-      object: "model",
-      created: Math.floor(Date.now() / 1000),
-      owned_by: "merge-gateway",
-    }));
-    sendJson(res, 200, JSON.stringify({ object: "list", data: models }));
+    await serveCatalog(res, catalogCache, config);
   }
 
   async function handleCompletion(
