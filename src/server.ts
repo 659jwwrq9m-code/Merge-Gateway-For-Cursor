@@ -25,6 +25,7 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { Capture } from "./capture.js";
 import { errorBody, jsonCompletion, jsonResponse, sseCompletion, sseResponse } from "./reply.js";
 import type { ShimConfig } from "./config.js";
@@ -119,8 +120,33 @@ async function relayResponse(res: ServerResponse, upstream: Response): Promise<v
   readable.pipe(res);
 }
 
-/** Explain a shape mismatch, which is far more common than a genuine bad request. */
-function dialectHint(shape: BodyShape, dialect: Dialect): string | undefined {
+/**
+ * Does this request carry the configured client key?
+ *
+ * Compared in constant time: a byte-by-byte early return leaks the secret's
+ * length and prefix to anyone who can time a response. A mismatch on length is
+ * still compared so the timing stays flat.
+ *
+ * Both `Authorization: Bearer <key>` and a bare `x-api-key` are accepted,
+ * because clients differ on which they send and Cursor only offers one field.
+ */
+function presentsClientKey(req: IncomingMessage, expected: string): boolean {
+  const header = req.headers.authorization;
+  const fromAuth = typeof header === "string" ? header.replace(/^Bearer\s+/i, "") : "";
+  const fromApiKey = req.headers["x-api-key"];
+  const presented = fromAuth || (typeof fromApiKey === "string" ? fromApiKey : "");
+
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) {
+    // Still burn a comparison so a wrong length is not measurably faster.
+    timingSafeEqual(b, b);
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
+/** Explain a shape mismatch, which is far more common than a genuine bad request. */function dialectHint(shape: BodyShape, dialect: Dialect): string | undefined {
   const path = dialect === "responses" ? "/v1/responses" : "/v1/chat/completions";
   const needed = dialect === "responses" ? "input" : "messages";
   const needsOther = dialect === "responses" ? shape.hasMessages : shape.hasInput;
@@ -209,11 +235,33 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const path = url.pathname;
 
+    // `/health` stays open: it reveals only whether the shim is up, and a
+    // tunnel or uptime check needs to reach it without holding the secret.
     if (path === "/health") {
       sendJson(
         res,
         200,
         JSON.stringify({ status: "ok", mode: config.passthrough ? "passthrough" : "capture" }),
+      );
+      return;
+    }
+
+    // Gate everything that can reach Gateway. A tunnel makes this URL public, and
+    // the shim holds the real Gateway key, so without a check anyone who learns
+    // the URL can spend those credits — the inbound Authorization header is not
+    // forwarded upstream and is otherwise ignored.
+    //
+    // /health stays open so a tunnel or uptime probe can verify liveness without
+    // holding the secret.
+    if (config.clientKey && !presentsClientKey(req, config.clientKey)) {
+      warn(`rejected ${method} ${path}: missing or wrong SHIM_CLIENT_KEY`);
+      sendJson(
+        res,
+        401,
+        errorBody(
+          "merge-gateway-shim requires the configured SHIM_CLIENT_KEY as an `Authorization: Bearer …` token.",
+          "invalid_api_key",
+        ),
       );
       return;
     }

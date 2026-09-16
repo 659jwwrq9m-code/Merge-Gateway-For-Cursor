@@ -155,6 +155,15 @@ export interface ShimConfig {
   capture: boolean;
   /** Forward to Gateway. Off by default so capture mode cannot spend money. */
   passthrough: boolean;
+  /**
+   * Shared secret a client must present to use the shim.
+   *
+   * Unset means no inbound check, which is safe only while the shim is
+   * loopback-only. Exposing it through a tunnel without this makes the shim an
+   * open proxy to the Gateway key: anyone who learns the URL can spend your
+   * credits, and the inbound Authorization header is otherwise ignored.
+   */
+  clientKey?: string;
   /** Cap on buffered request bodies, in bytes. */
   maxBodyBytes: number;
   /**
@@ -281,6 +290,7 @@ export function resolveConfig(
       DEFAULTS.maxBodyBytes,
     ),
     filterModels: flags.noModelFilter ? false : asBool(env.SHIM_FILTER_MODELS, true),
+    clientKey: env.SHIM_CLIENT_KEY?.trim() || undefined,
     quiet: flags.quiet ?? asBool(env.SHIM_QUIET, false),
   };
 }
