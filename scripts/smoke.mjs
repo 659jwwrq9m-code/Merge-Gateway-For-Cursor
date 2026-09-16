@@ -192,24 +192,34 @@ async function main() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(responsesShaped),
     });
-    const notImpl = await res.json();
-    check("POST /v1/responses → 501 with guidance", res.status === 501, `got ${res.status}`);
+    check("POST /v1/responses → 200", res.status === 200, `got ${res.status}`);
     check(
-      "501 message names the right base URL",
-      /chat\/completions/.test(notImpl.error?.message ?? ""),
-      notImpl.error?.message,
+      "replies as Responses SSE",
+      (res.headers.get("content-type") ?? "").includes("text/event-stream"),
+      res.headers.get("content-type") ?? "",
     );
+    const responsesBody = await res.text();
+    check("emits response.created", responsesBody.includes("response.created"), responsesBody.slice(0, 200));
+    check(
+      "emits response.output_text.delta",
+      responsesBody.includes("response.output_text.delta"),
+      responsesBody.slice(0, 400),
+    );
+    check("ends with response.completed", responsesBody.includes("response.completed"));
 
     // --- capture ----------------------------------------------------------
     console.log("\ncaptures");
+    // 5 /v1/chat/completions requests (responses-shaped, flat tools, mixed,
+    // clean chat, malformed) plus the /v1/responses request above.
+    const expectedCaptures = 6;
     const files = readdirSync(captureDir).filter((f) => f.endsWith(".json"));
-    check("wrote one capture per request", files.length === 5, `found ${files.length}`);
+    check("wrote one capture per request", files.length === expectedCaptures, `found ${files.length}`);
 
     const indexLines = readFileSync(join(captureDir, "index.jsonl"), "utf8")
       .trim()
       .split("\n")
       .map((l) => JSON.parse(l));
-    check("index has a line per request", indexLines.length === 5, `found ${indexLines.length}`);
+    check("index has a line per request", indexLines.length === expectedCaptures, `found ${indexLines.length}`);
 
     const first = indexLines[0];
     check("detected responses dialect", first.kind === "responses", first.kind);

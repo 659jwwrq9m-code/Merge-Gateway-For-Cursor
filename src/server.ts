@@ -170,23 +170,35 @@ export function createShimServer(config: ShimConfig): Server {
   }
 
   async function handleModels(res: ServerResponse): Promise<void> {
-    if (!config.passthrough || !config.apiKey) {
-      // A minimal list keeps Cursor's picker happy in capture mode.
-      const models = [config.defaultModel ?? "anthropic/claude-opus-5"].map((id) => ({
-        id,
-        object: "model",
-        owned_by: "merge-gateway",
-      }));
-      sendJson(res, 200, JSON.stringify({ object: "list", data: models }));
-      return;
+    // Gateway's /v1/openai/models is a free, authenticated call, so the real
+    // catalogue is proxied whenever a key is available — even in capture mode,
+    // which never spends anything. This matters for clients that validate a
+    // provider by listing its models first: Xcode refuses to add a provider
+    // whose model list it cannot parse.
+    //
+    // Gateway's *native* /v1/models is not usable for that, because entries key
+    // the id as `model` rather than OpenAI's `id`. Hence /v1/openai/models.
+    if (config.apiKey) {
+      try {
+        const upstream = await forwardModels(config);
+        if (upstream.ok) {
+          await relayResponse(res, upstream);
+          return;
+        }
+        warn(`Gateway returned ${upstream.status} for the model list; serving a stub instead`);
+      } catch (error) {
+        warn(`could not fetch the model list: ${(error as Error).message}`);
+      }
     }
 
-    try {
-      const upstream = await forwardModels(config);
-      await relayResponse(res, upstream);
-    } catch (error) {
-      sendJson(res, 502, errorBody(`could not reach Gateway: ${(error as Error).message}`, "upstream_error"));
-    }
+    // A minimal but correctly-shaped list, so a picker still populates.
+    const models = [config.defaultModel ?? "anthropic/claude-opus-5"].map((id) => ({
+      id,
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: "merge-gateway",
+    }));
+    sendJson(res, 200, JSON.stringify({ object: "list", data: models }));
   }
 
   async function handleCompletion(
@@ -239,32 +251,31 @@ export function createShimServer(config: ShimConfig): Server {
       return;
     }
 
-    // The shape mismatch is worth naming explicitly: it is the exact failure this
-    // project exists to work around, and a generic 400 would hide it.
+    // A Responses request is already in the dialect Gateway's /responses wants,
+    // so it is forwarded as-is. A Chat request is normalised, because Cursor may
+    // have sent a Responses-shaped body to the Chat path — that mismatch is the
+    // exact failure this project exists to work around, so it must be translated
+    // rather than rejected.
+    let outbound: unknown = body;
+    let notes: string[] = [];
+    if (dialect !== "responses") {
+      ({ body: outbound, notes } = toChatCompletions(body));
+      if (notes.length > 0) debug(`translate: ${notes.join("; ")}`);
+    }
+
+    // Only now, with translation attempted, is a shape mismatch worth naming: it
+    // means the body is neither dialect for this path and a generic 400 would
+    // hide why.
     const hint = dialectHint(shape, dialect);
-    if (hint) {
+    if (hint && notes.length === 0) {
       warn(hint);
       sendJson(res, 400, errorBody(hint));
       return;
     }
 
-    // A Responses request is already in the dialect Gateway's /responses wants,
-    // so it is forwarded as-is. A Chat request is normalised, because Cursor may
-    // have sent a Responses-shaped body to the Chat path.
-    const isResponses = dialect === "responses";
-
-    if (isResponses) {
-      if (config.passthrough) {
-        await handlePassthrough(res, body, seq, "responses");
-        return;
-      }
-    } else {
-      const { body: outbound, notes } = toChatCompletions(body);
-      if (notes.length > 0) debug(`translate: ${notes.join("; ")}`);
-      if (config.passthrough) {
-        await handlePassthrough(res, outbound, seq, "chat_completions");
-        return;
-      }
+    if (config.passthrough) {
+      await handlePassthrough(res, outbound, seq, dialect);
+      return;
     }
 
     await handleCaptureReply(res, shape, raw.length, dialect);
