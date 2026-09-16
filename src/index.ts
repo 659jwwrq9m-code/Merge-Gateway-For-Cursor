@@ -211,15 +211,6 @@ async function main(): Promise<void> {
 
   const server = startServer(config);
 
-  server.on("error", (error: NodeJS.ErrnoException) => {
-    if (error.code === "EADDRINUSE") {
-      fail(`port ${config.port} is already in use. Stop the other process or pass --port <n>.`);
-    } else {
-      fail(`server error: ${error.message}`);
-    }
-    process.exit(1);
-  });
-
   const shutdown = (signal: string): void => {
     info(`${signal} received, shutting down`);
     server.close(() => process.exit(0));

@@ -162,7 +162,12 @@ export interface ShimConfig {
 
 export const DEFAULTS = {
   gatewayBaseUrl: "https://api-gateway.merge.dev/v1/openai",
-  host: "127.0.0.1",
+  // `localhost` rather than `127.0.0.1` so both loopback stacks are bound.
+  // macOS resolves `localhost` to `::1` first, and Xcode's "Locally Hosted"
+  // provider mode builds its URL from `localhost` without offering a host
+  // field — so an IPv4-only listener can be unreachable from Xcode even though
+  // curl works. Still loopback-only either way.
+  host: "localhost",
   port: 8787,
   captureDir: "captures",
   maxBodyBytes: 64 * 1024 * 1024,

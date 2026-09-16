@@ -122,16 +122,26 @@ function dialectHint(shape: BodyShape, dialect: Dialect): string | undefined {
 }
 
 export function createShimServer(config: ShimConfig): Server {
+  return createServer(createRequestHandler(config));
+}
+
+/**
+ * Build the request handler.
+ *
+ * Separate from the server so the same handler can be attached to more than one
+ * listener — see `startServer`, which binds both loopback stacks.
+ */
+function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: ServerResponse) => void {
   const capture = new Capture(config.captureDir);
 
-  const server = createServer((req, res) => {
+  return (req, res) => {
     void handle(req, res).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       warn(`unhandled error: ${message}`);
       if (!res.headersSent) sendJson(res, 500, errorBody(message, "server_error"));
       else res.end();
     });
-  });
+  };
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = req.method ?? "GET";
@@ -357,15 +367,65 @@ export function createShimServer(config: ShimConfig): Server {
     });
     res.end(payload);
   }
-
-  return server;
 }
 
+/**
+ * Bind loopback on both address families.
+ *
+ * `localhost` resolves to `::1` before `127.0.0.1` on macOS, and a client that
+ * only tries the first answer gets ECONNREFUSED against a IPv4-only listener.
+ * curl falls back to IPv4 so this is invisible from the shell, but URLSession —
+ * which is what Xcode uses — does not necessarily. Binding both removes the
+ * question entirely.
+ *
+ * A non-loopback host gets a single listener, since the user has explicitly
+ * chosen an interface and silently adding another would widen exposure.
+ */
 export function startServer(config: ShimConfig): Server {
-  const server = createShimServer(config);
-  server.listen(config.port, config.host, () => {
-    const mode = config.passthrough ? "passthrough → Gateway" : "capture only (no upstream calls)";
-    info(`listening on http://${config.host}:${config.port}/v1 · ${mode}`);
-  });
-  return server;
+  const mode = config.passthrough ? "passthrough → Gateway" : "capture only (no upstream calls)";
+  const handler = createRequestHandler(config);
+  const primary = createServer(handler);
+
+  const listeners: Server[] = [primary];
+
+  if (config.host === "localhost") {
+    // `::` accepts IPv4-mapped traffic on dual-stack systems, so this one socket
+    // covers both families. If the host has IPv6 disabled, fall back to IPv4.
+    const secondary = createServer(handler);
+    const fallback = createServer(handler);
+    let settled = false;
+
+    secondary.on("error", () => {
+      if (settled) return;
+      settled = true;
+      secondary.close();
+      fallback.listen(config.port, "127.0.0.1", () => {
+        info(`listening on http://127.0.0.1:${config.port}/v1 (IPv4 only) · ${mode}`);
+      });
+      fallback.on("error", (error: NodeJS.ErrnoException) => reportListenError(error, config));
+    });
+
+    secondary.listen(config.port, "::", () => {
+      settled = true;
+      info(`listening on http://localhost:${config.port}/v1 (IPv4 + IPv6) · ${mode}`);
+    });
+
+    listeners.push(secondary, fallback);
+  } else {
+    primary.listen(config.port, config.host, () => {
+      info(`listening on http://${config.host}:${config.port}/v1 · ${mode}`);
+    });
+    primary.on("error", (error: NodeJS.ErrnoException) => reportListenError(error, config));
+  }
+
+  return primary;
+}
+
+function reportListenError(error: NodeJS.ErrnoException, config: ShimConfig): void {
+  if (error.code === "EADDRINUSE") {
+    warn(`port ${config.port} is already in use. Stop the other process or pass --port <n>.`);
+  } else {
+    warn(`could not listen on ${config.host}:${config.port} — ${error.message}`);
+  }
+  process.exitCode = 1;
 }
