@@ -439,17 +439,72 @@ npm run check:env
 Cursor calls the base URL directly, so **the shim must already be running**. It
 does not start anything for you, and a closed terminal takes it down.
 
-To keep it up, run it in the background. On macOS and Linux:
+### Keep it always running (macOS, recommended: launchd)
 
-```sh
-nohup npm start > /tmp/shim.log 2>&1 &
+If the shim lives in a Cursor terminal — or any terminal — anything that quits
+that app kills it with SIGKILL: no error, no log line, the port just goes dead
+and Cursor starts reporting provider errors. A `launchd` user service avoids
+that entirely: it runs outside Cursor, restarts the shim if it dies, starts on
+login, and survives sleep and reboots.
+
+Create `~/Library/LaunchAgents/com.chrisminshall.merge-gateway-shim.plist`
+(adapt the label, node path, and paths to your setup — `which node` gives the
+absolute node path, which launchd needs because it does not read nvm):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.chrisminshall.merge-gateway-shim</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/YOU/.nvm/versions/node/vX.Y.Z/bin/node</string>
+      <string>dist/index.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/merge-gateway-shim</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/merge-gateway-shim.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/merge-gateway-shim.log</string>
+  </dict>
+</plist>
 ```
 
-On Windows, use a second PowerShell window, or register a scheduled task:
+Load it and verify:
+
+```sh
+launchctl load ~/Library/LaunchAgents/com.chrisminshall.merge-gateway-shim.plist
+curl http://127.0.0.1:8787/health   # {"status":"ok","mode":"passthrough"}
+```
+
+With `KeepAlive` on, `kill -9` on the shim gets answered by a fresh process
+within a few seconds — verified by killing it and watching it come back. Manage
+it with:
+
+```sh
+launchctl print gui/$(id -u)/com.chrisminshall.merge-gateway-shim  # status
+launchctl kickstart -k gui/$(id -u)/com.chrisminshall.merge-gateway-shim  # restart
+launchctl bootout gui/$(id -u)/com.chrisminshall.merge-gateway-shim  # stop & unload
+```
+
+The service log lands in `/tmp/merge-gateway-shim.log`. On Windows, use a
+second PowerShell window, or register a scheduled task:
 
 ```powershell
 Start-Process -NoNewWindow npm -ArgumentList "start" -RedirectStandardOutput shim.log
 ```
+
+On Linux, the equivalent is a systemd user unit (`~/.config/systemd/user/` with
+`Restart=always`, enabled via `systemctl --user enable --now`).
 
 `npm start` binds loopback only, so nothing outside your machine can reach it —
 which is why the key inside it stays safe. That changes the moment you expose
