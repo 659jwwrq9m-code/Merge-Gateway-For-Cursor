@@ -96,6 +96,61 @@ function pickModel(shape: BodyShape, config: ShimConfig): string {
   return shape.model ?? config.defaultModel ?? "shim/unknown";
 }
 
+/**
+ * Ollama-style model names Cursor may be configured with, mapped to the id
+ * Gateway actually routes.
+ *
+ * WHY THIS EXISTS. Cursor derives a model's context window from its *name*, not
+ * from anything on the wire: an id it recognises (Ollama's `glm-5.3-flash:cloud`)
+ * gets the real 1M window, an unknown id like `zai/glm-5.3-flash` falls back to
+ * a 200K ceiling. Accepting the Ollama name lets Cursor show the correct window
+ * while Gateway still gets an id it can route. The shim echoes the *incoming*
+ * name back in responses (see `pickModel`), so the client-side identity never
+ * changes — only the upstream id does.
+ *
+ * Kept as an explicit table rather than a generic `:cloud`-strip rule: a wrong
+ * guess here is a 400 from Gateway on every request, and an explicit mapping
+ * can be verified against the live catalogue before it ships.
+ */
+const MODEL_ALIASES: Record<string, string> = {
+  "glm-5.3-flash:cloud": "zai/glm-5.3-flash",
+};
+
+/** Rewrite an Ollama-style model id to its Gateway equivalent. */
+export function applyModelAliases(body: unknown): string | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const request = body as Record<string, unknown>;
+  const model = request.model;
+  if (typeof model !== "string") return undefined;
+  const mapped = MODEL_ALIASES[model];
+  if (mapped === undefined || mapped === model) return undefined;
+  request.model = mapped;
+  return `model alias: ${model} -> ${mapped}`;
+}
+
+/**
+ * Add the Ollama-style alias ids to a served model list.
+ *
+ * The other half of `applyModelAliases`: the shim accepts an alias inbound, so
+ * the list it serves must advertise the alias too, or a client validating its
+ * configured model against the fetched list (Cursor does this when you submit)
+ * rejects a name the shim would happily route. Each alias entry is a clone of
+ * its target's metadata under the alias id, so capability fields like
+ * `context_length` travel with it. An alias already present is left alone.
+ */
+export function withModelAliases<T extends { id: string }>(entries: T[]): T[] {
+  const known = new Set(entries.map((entry) => entry.id));
+  const out = [...entries];
+  for (const [alias, target] of Object.entries(MODEL_ALIASES)) {
+    if (known.has(alias)) continue;
+    const entry = entries.find((candidate) => candidate.id === target);
+    if (!entry) continue;
+    out.push({ ...entry, id: alias });
+    known.add(alias);
+  }
+  return out;
+}
+
 function sendJson(res: ServerResponse, status: number, payload: string): void {
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -365,6 +420,73 @@ export function requiresReasoningEcho(model: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Keys in Cursor's `Task` tool schema typed as boolean. Everything else in a
+ * tool call is free-form (descriptions, prompts, paths), so a coercion keyed
+ * to exactly these names cannot corrupt arguments that legitimately carry the
+ * string "true".
+ */
+const BOOLEAN_TOOL_ARGS = new Set(["interrupt", "run_in_background"]);
+
+/**
+ * Coerce stringified booleans inside tool-call arguments to real booleans.
+ *
+ * WHY THIS EXISTS. Captures from a live session show the model emitting
+ * `"interrupt":"true"` (a string) in a `Task` call, while Cursor's schema
+ * requires `boolean`. Cursor's validator rejects the call —
+ * `Error: Invalid arguments: interrupt: Expected boolean, received string` —
+ * feeds that error back as a tool result, and the model retries with the same
+ * wrong type, looping dozens of times while the agent never spawns. The model
+ * (GLM, observed 2026-09-17) does not self-correct from the error text, so the
+ * loop only ends when the shim stops the bad arguments from reaching Cursor.
+ *
+ * Only the streamed-args form needs handling: Gateway delivers each complete
+ * tool call in a single frame (the property `reshapeChunks` relies on to split
+ * parallel calls), so arguments are intact JSON by the time they pass through
+ * here. Any partial-JSON escape hatches can be added if a provider starts
+ * splitting arguments across frames.
+ *
+ * Malformed JSON is left untouched — that is Cursor's error to report, and
+ * mangling it further would only hide the cause.
+ */
+export function coerceBooleanToolArgs(body: unknown): string | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const messages = (body as Record<string, unknown>).messages;
+  if (!Array.isArray(messages)) return undefined;
+
+  let coerced = 0;
+  for (const message of messages) {
+    if (typeof message !== "object" || message === null) continue;
+    for (const call of (message as Record<string, unknown>).tool_calls as unknown[] | undefined ?? []) {
+      if (typeof call !== "object" || call === null) continue;
+      const fn = (call as Record<string, unknown>).function;
+      if (typeof fn !== "object" || fn === null) continue;
+      const raw = (fn as Record<string, unknown>).arguments;
+      if (typeof raw !== "string") continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      if (typeof parsed !== "object" || parsed === null) continue;
+      const args = parsed as Record<string, unknown>;
+      let changed = false;
+      for (const key of BOOLEAN_TOOL_ARGS) {
+        const value = args[key];
+        if (value === "true" || value === "false") {
+          args[key] = value === "true";
+          changed = true;
+          coerced += 1;
+        }
+      }
+      if (changed) (fn as Record<string, unknown>).arguments = JSON.stringify(args);
+    }
+  }
+
+  return coerced > 0 ? `coerced ${coerced} string boolean(s) in tool-call arguments` : undefined;
+}
+
 /** Explain a shape mismatch, which is far more common than a genuine bad request. */function dialectHint(shape: BodyShape, dialect: Dialect): string | undefined {
   const path = dialect === "responses" ? "/v1/responses" : "/v1/chat/completions";
   const needed = dialect === "responses" ? "input" : "messages";
@@ -415,18 +537,21 @@ async function serveCatalog(res: ServerResponse, cache: CatalogCache, config: Sh
   const catalog = cache.catalog ?? (await buildCatalog(config).catch(() => undefined));
   if (catalog) {
     cache.catalog = catalog;
-    sendJson(res, 200, JSON.stringify({ object: "list", data: toOpenAIModelList(catalog) }));
+    sendJson(res, 200, JSON.stringify({ object: "list", data: withModelAliases(toOpenAIModelList(catalog)) }));
     return;
   }
 
-  // A minimal but correctly-shaped list, so a picker still populates.
+  // A minimal but correctly-shaped list, so a picker still populates. The alias
+  // ids ride along here too, mapped onto the fallback model's shape.
   warn("could not read the Gateway catalogue; serving a stub instead");
-  const models = [config.defaultModel ?? "anthropic/claude-opus-5"].map((id) => ({
-    id,
-    object: "model",
-    created: 0,
-    owned_by: "merge-gateway",
-  }));
+  const models = withModelAliases(
+    [config.defaultModel ?? "anthropic/claude-opus-5"].map((id) => ({
+      id,
+      object: "model",
+      created: 0,
+      owned_by: "merge-gateway",
+    })),
+  );
   sendJson(res, 200, JSON.stringify({ object: "list", data: models }));
 }
 
@@ -550,10 +675,18 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
       try {
         const upstream = await forwardModels(config);
         if (upstream.ok) {
-          await relayResponse(res, upstream);
-          return;
+          const payload = (await upstream.json()) as { data?: Array<{ id: string }> };
+          if (Array.isArray(payload.data)) {
+            // The alias ids must appear in the list Cursor validates against;
+            // see `withModelAliases`.
+            payload.data = withModelAliases(payload.data);
+            sendJson(res, 200, JSON.stringify(payload));
+            return;
+          }
+          warn("Gateway model list had no data array; falling back to the catalogue");
+        } else {
+          warn(`Gateway returned ${upstream.status} for the model list; falling back to the catalogue`);
         }
-        warn(`Gateway returned ${upstream.status} for the model list; falling back to the catalogue`);
       } catch (error) {
         warn(`could not fetch the model list: ${(error as Error).message}`);
       }
@@ -632,10 +765,28 @@ function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: S
     //
     // Disabling reasoning for these requests is the workable fix: the model
     // answers with tool calls as usual, and the agent loop completes.
+    // Accept Ollama-style model names Cursor may be configured with; the
+    // incoming name is echoed back unchanged (see `pickModel`), only the
+    // upstream id is rewritten. Runs before the reasoning check so it sees the
+    // Gateway id.
+    const aliasNote = applyModelAliases(outbound);
+    if (aliasNote) {
+      notes = [...notes, aliasNote];
+      debug(aliasNote);
+    }
+
     const reasoningNote = disableUnpreservableReasoning(outbound, config);
     if (reasoningNote) {
       notes = [...notes, reasoningNote];
       debug(`reasoning: ${reasoningNote}`);
+    }
+
+    // Fix stringified booleans in tool-call arguments before Cursor's schema
+    // validator sees them; see `coerceBooleanToolArgs` for the failure it ends.
+    const coercionNote = coerceBooleanToolArgs(outbound);
+    if (coercionNote) {
+      notes = [...notes, coercionNote];
+      debug(`args: ${coercionNote}`);
     }
 
     // Only now, with translation attempted, is a shape mismatch worth naming: it
