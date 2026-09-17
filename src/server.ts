@@ -33,7 +33,7 @@ import { classifyBody, describeShape, type BodyShape } from "./shape.js";
 import { toChatCompletions } from "./translate.js";
 import { readCatalog, toOpenAIModelList, type CatalogModel } from "./catalog.js";
 import { forwardChatCompletion, forwardModels, forwardNativeModels, forwardResponses } from "./upstream.js";
-import { reshapeChunk, reshapeCompletion } from "./reshape.js";
+import { reshapeChunk, reshapeChunks, reshapeCompletion } from "./reshape.js";
 import { debug, info, request as logRequest, warn } from "./log.js";
 
 /** Which wire dialect the request path implies, and therefore the reply shape. */
@@ -204,9 +204,9 @@ async function relayStreamReshaped(
       return;
     }
 
-    let next: unknown;
+    let next: unknown[];
     try {
-      next = reshapeChunk(JSON.parse(payload), model);
+      next = reshapeChunks(JSON.parse(payload), model);
     } catch {
       // Unparseable frame: forward it rather than silently eating content.
       res.write(`${trimmed}\n`);
@@ -214,12 +214,17 @@ async function relayStreamReshaped(
       return;
     }
 
-    if (next === undefined) {
+    if (next.length === 0) {
       lastDropped = true;
       return;
     }
 
-    res.write(`data: ${JSON.stringify(next)}\n`);
+    // A frame carrying several tool calls becomes one frame per call, so a
+    // streaming client that accumulates per frame sees every call. See
+    // `reshapeChunks`.
+    for (const frame of next) {
+      res.write(`data: ${JSON.stringify(frame)}\n\n`);
+    }
     lastDropped = false;
   };
 

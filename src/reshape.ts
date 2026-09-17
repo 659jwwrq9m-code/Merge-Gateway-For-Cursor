@@ -132,6 +132,82 @@ export function reshapeChunk(chunk: unknown, requestedModel?: string): unknown |
 }
 
 /**
+ * Rewrite one streamed chunk into the **sequence** of frames a client should see.
+ *
+ * Almost always one frame in, one frame out. The exception is the one that
+ * breaks parallel sub-agents, and it is worth being precise about because the
+ * shape difference is invisible in the payload — only in how it is divided.
+ *
+ * When a turn calls N tools at once, Gateway packs **all N calls into a single
+ * frame**; Ollama emits **one frame per call**. Both are valid OpenAI, and a
+ * non-streaming client cannot tell them apart. A streaming client that
+ * accumulates `tool_calls` per frame — which is what Cursor does — sees
+ * Gateway's single frame as *one* call, so a request to spawn three sub-agents
+ * spawns one and silently loses the rest.
+ *
+ * Measured, same prompt and same model, streaming:
+ *
+ *   Ollama  → 3 frames, 1 `Task` call each   → Cursor spawns 3
+ *   Gateway → 1 frame,  3 `Task` calls       → Cursor spawns 1
+ *
+ * So a frame carrying more than one call is split into one frame per call,
+ * each holding a single-element `tool_calls` array with its original `index`
+ * preserved. Everything else about the frame — id, model, created, the choice
+ * index, `finish_reason` — is repeated, which is what a client accumulating
+ * per frame expects.
+ *
+ * The split is deliberately conservative: it fires only when a frame actually
+ * carries multiple calls, so every other frame on the wire is untouched.
+ */
+export function reshapeChunks(chunk: unknown, requestedModel?: string): unknown[] {
+  const single = reshapeChunk(chunk, requestedModel);
+  if (single === undefined) return [];
+
+  if (!isRecord(single)) return [single];
+
+  const choices = single.choices;
+  if (!Array.isArray(choices)) return [single];
+
+  // Does any choice carry more than one call?
+  const needsSplit = choices.some((choice) => {
+    if (!isRecord(choice)) return false;
+    const delta = choice.delta;
+    return isRecord(delta) && Array.isArray(delta.tool_calls) && delta.tool_calls.length > 1;
+  });
+  if (!needsSplit) return [single];
+
+  const frames: unknown[] = [];
+
+  for (const choice of choices) {
+    if (!isRecord(choice)) continue;
+    const delta = isRecord(choice.delta) ? choice.delta : {};
+    const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+
+    if (calls.length <= 1) {
+      // This choice is ordinary; it rides along on the first frame so no
+      // content is duplicated across the split.
+      frames.push({ ...single, choices: [choice] });
+      continue;
+    }
+
+    for (const call of calls) {
+      frames.push({
+        ...single,
+        choices: [
+          {
+            ...choice,
+            delta: { ...delta, tool_calls: [call] },
+          },
+        ],
+      });
+    }
+  }
+
+  // A frame whose only content was the calls list must not also appear whole.
+  return frames.length > 0 ? frames : [single];
+}
+
+/**
  * Rewrite a complete non-streaming response.
  *
  * Same field moves as the streaming case, applied to `choices[].message`. The

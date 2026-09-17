@@ -23,7 +23,7 @@
  * Run with:  node scripts/response-check.mjs
  */
 
-import { reshapeChunk, reshapeCompletion } from "../dist/reshape.js";
+import { reshapeChunk, reshapeChunks, reshapeCompletion } from "../dist/reshape.js";
 
 let failures = 0;
 const check = (label, ok, detail = "") => {
@@ -236,5 +236,179 @@ console.log("response translation");
   check("completion model restored", out?.model === "deepseek/deepseek-v4.1-flash", String(out?.model));
 }
 
+// ---------------------------------------------------------------------------
+// Parallel tool calls.
+//
+// The bug this guards: Cursor could only spawn ONE sub-agent at a time; the
+// rest failed silently. Same model, same prompt, streaming — the only
+// difference is how the calls are divided across frames.
+//
+// Measured against both providers (glm-5.3-flash, three Task calls requested):
+//
+//   Ollama  -> 3 frames, each carrying 1 call   -> Cursor spawns 3
+//   Gateway -> 1 frame  carrying 3 calls        -> Cursor spawns 1
+//
+// Cursor accumulates `tool_calls` per frame, so N-in-one reads as one call.
+// `reshapeChunks` splits that frame; everything else is untouched.
+//
+// The fixture below is the REAL Gateway frame, captured verbatim.
+console.log("\nparallel tool calls: splitting a multi-call frame");
+
+const realGatewayFrame = {
+  id: "chatcmpl-cc_5e8b983ba6bc0bde",
+  object: "chat.completion.chunk",
+  created: 1789626519,
+  model: "glm-5.3-flash",
+  choices: [
+    {
+      index: 0,
+      delta: {
+        role: null,
+        content: null,
+        tool_calls: [
+          {
+            index: 0,
+            id: "call_89d4a23ac097453f8f2eb192",
+            type: "function",
+            function: { name: "Task", arguments: '{"description": "Spawn agent alpha"}' },
+          },
+          {
+            index: 1,
+            id: "call_5b4f3f5e78564e5eb31a8e40",
+            type: "function",
+            function: { name: "Task", arguments: '{"description": "Spawn agent beta"}' },
+          },
+          {
+            index: 2,
+            id: "call_6e1cf4e900d54b6889126e44",
+            type: "function",
+            function: { name: "Task", arguments: '{"description": "Spawn agent gamma"}' },
+          },
+        ],
+        annotations: null,
+        thinking: null,
+        thinking_signature: null,
+      },
+      finish_reason: null,
+      logprobs: null,
+    },
+  ],
+  usage: null,
+  system_fingerprint: null,
+  service_tier: null,
+  routing: null,
+  guardrails: null,
+  warnings: null,
+};
+
+{
+  const frames = reshapeChunks(realGatewayFrame, "zai/glm-5.3-flash");
+
+  check("one Gateway frame becomes three", frames.length === 3, `got ${frames.length}`);
+
+  const calls = frames.map((f) => f?.choices?.[0]?.delta?.tool_calls ?? []);
+  check(
+    "each frame carries exactly one call",
+    calls.length === 3 && calls.every((c) => c.length === 1),
+    JSON.stringify(calls.map((c) => c.length)),
+  );
+  check(
+    "all three call ids survive, in order",
+    calls.map((c) => c[0]?.id).join(",") ===
+      "call_89d4a23ac097453f8f2eb192,call_5b4f3f5e78564e5eb31a8e40,call_6e1cf4e900d54b6889126e44",
+    calls.map((c) => c[0]?.id).join(","),
+  );
+  check(
+    "the original `index` is preserved on each call",
+    calls.map((c) => c[0]?.index).join(",") === "0,1,2",
+    calls.map((c) => c[0]?.index).join(","),
+  );
+  check(
+    "arguments are not corrupted by the split",
+    calls[1]?.[0]?.function?.arguments === '{"description": "Spawn agent beta"}',
+    String(calls[1]?.[0]?.function?.arguments),
+  );
+  check(
+    "each frame keeps the envelope (id, model, created, object)",
+    frames.every(
+      (f) =>
+        f?.id === realGatewayFrame.id &&
+        f?.model === "zai/glm-5.3-flash" &&
+        f?.created === realGatewayFrame.created &&
+        f?.object === "chat.completion.chunk",
+    ),
+  );
+  check(
+    "the choice index is repeated on every frame",
+    frames.every((f) => f?.choices?.[0]?.index === 0),
+  );
+  check(
+    "gateway-only keys are still stripped after the split",
+    frames.every((f) => !("guardrails" in (f ?? {})) && !("routing" in (f ?? {}))),
+  );
+  check(
+    "thinking/annotations are still stripped after the split",
+    frames.every((f) => {
+      const d = f?.choices?.[0]?.delta ?? {};
+      return !("thinking" in d) && !("annotations" in d) && !("thinking_signature" in d);
+    }),
+  );
+
+  // A single call must NOT be split or duplicated.
+  const singleCall = reshapeChunks(
+    {
+      ...realGatewayFrame,
+      choices: [
+        {
+          ...realGatewayFrame.choices[0],
+          delta: { ...realGatewayFrame.choices[0].delta, tool_calls: [realGatewayFrame.choices[0].delta.tool_calls[0]] },
+        },
+      ],
+    },
+    "zai/glm-5.3-flash",
+  );
+  check("a single call is passed through as one frame", singleCall.length === 1, `got ${singleCall.length}`);
+
+  // Ordinary content frames must be untouched.
+  const contentFrame = {
+    id: "x",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "glm-5.3-flash",
+    choices: [{ index: 0, delta: { content: "hello" }, finish_reason: null }],
+  };
+  const contentOut = reshapeChunks(contentFrame, "zai/glm-5.3-flash");
+  check("a content frame stays one frame", contentOut.length === 1);
+  check(
+    "a content frame's text is unchanged",
+    contentOut[0]?.choices?.[0]?.delta?.content === "hello",
+  );
+
+  // A frame that carries nothing still vanishes entirely.
+  check(
+    "a no-op frame yields zero frames",
+    reshapeChunks({ choices: [{ index: 0, delta: { content: null }, finish_reason: null }] }).length === 0,
+  );
+
+  // Two calls, not three — the split is by count, not a fixed 3.
+  const two = reshapeChunks(
+    {
+      ...realGatewayFrame,
+      choices: [
+        {
+          ...realGatewayFrame.choices[0],
+          delta: { ...realGatewayFrame.choices[0].delta, tool_calls: realGatewayFrame.choices[0].delta.tool_calls.slice(0, 2) },
+        },
+      ],
+    },
+    "zai/glm-5.3-flash",
+  );
+  check("two calls become two frames", two.length === 2, `got ${two.length}`);
+  check(
+    "the split preserves order for two calls",
+    two.map((f) => f?.choices?.[0]?.delta?.tool_calls?.[0]?.index).join(",") === "0,1",
+  );
+}
+
 console.log(failures === 0 ? "\nresponse translation: all checks passed" : `\nresponse translation: ${failures} FAILED`);
-process.exit(failures === 0 ? 0 : 1);
+  process.exit(failures === 0 ? 0 : 1);
