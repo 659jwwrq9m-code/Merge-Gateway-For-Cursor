@@ -20,6 +20,47 @@ import { redactHeaders } from "./config.js";
 import { debug, warn } from "./log.js";
 import { describeShape, type BodyShape } from "./shape.js";
 
+/**
+ * Secrets to scrub from capture bodies, set by the server at startup.
+ *
+ * WHY BODIES NEED REDACTION TOO. `redactHeaders` covers the wire headers, but
+ * the body is a full agent transcript, and transcripts absorb whatever was ever
+ * printed into the conversation: `.env` dumps, echoed keys, connection info.
+ * Capturing the body verbatim therefore puts every secret that ever entered
+ * the session on disk in plaintext — found in live captures on 2026-09-17
+ * (both the Gateway key and the client key, inside `messages[].content`).
+ * The server registers its configured secrets here at startup; anything
+ * matching is replaced before the JSON is written.
+ */
+const bodySecrets: { needle: string; label: string }[] = [];
+
+/** Register a secret string to scrub from capture bodies. */
+export function registerBodySecret(value: string | undefined, label: string): void {
+  if (typeof value === "string" && value.length >= 8) bodySecrets.push({ needle: value, label });
+}
+
+/** Replace every registered secret in a string. */
+function scrubText(text: string): string {
+  let out = text;
+  for (const { needle, label } of bodySecrets) {
+    if (out.includes(needle)) out = out.split(needle).join(`[REDACTED:${label}]`);
+  }
+  return out;
+}
+
+/** Deeply scrub a parsed JSON body so no registered secret survives on disk. */
+export function redactBody(body: unknown): unknown {
+  if (bodySecrets.length === 0 || body === null || typeof body !== "object") return body;
+  if (Array.isArray(body)) return body.map(redactBody);
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+    if (typeof value === "string") out[key] = scrubText(value);
+    else if (value !== null && typeof value === "object") out[key] = redactBody(value);
+    else out[key] = value;
+  }
+  return out;
+}
+
 export interface CaptureRecord {
   /** Monotonic per-process request number, matching the index.jsonl line. */
   seq: number;
@@ -82,7 +123,11 @@ export class Capture {
   }): CaptureSummary | undefined {
     if (!this.ensureDir()) return undefined;
 
-    const safe: CaptureRecord = { ...record, headers: redactHeaders(record.headers) };
+    const safe: CaptureRecord = {
+      ...record,
+      headers: redactHeaders(record.headers),
+      body: record.body === undefined ? undefined : redactBody(record.body),
+    };
     const file = join(
       this.dir,
       `${Capture.stamp(new Date(record.receivedAt))}-${String(record.seq).padStart(3, "0")}.json`,

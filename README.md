@@ -588,8 +588,69 @@ Two caveats on quick tunnels:
 - **The URL is temporary.** It is regenerated whenever `cloudflared` restarts, so
   Cursor's base URL has to be updated to match. For anything long-lived, set up a
   [named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
-  with a stable hostname instead.
+  with a stable hostname instead — the next section shows how.
 - **Quick tunnels are public.** Anyone who learns the URL can reach the shim.
+
+### Quick tunnels are for experiments only — plan for a permanent one
+
+A quick tunnel is fine for an afternoon of testing, but as a standing setup it
+has real limitations:
+
+- **The hostname is random and ephemeral.** `trycloudflare.com` URLs are issued
+  per process. Restart `cloudflared`, reboot the machine, or let the process
+  die, and the URL is gone — and every client pointed at it breaks until you
+  re-copy a new URL into Cursor. If the shim is meant to be *infrastructure*
+  (something you rely on daily), a dependency that reshuffles its own address
+  is the wrong shape.
+- **No ownership, no control.** A quick tunnel is anonymous: no DNS record you
+  can inspect, no access policy you can attach, no logs tied to a tunnel you
+  own, and Cloudflare can rate-limit or retire the free trycloudflare service
+  at any time.
+- **Observability is poor.** With no named tunnel there is no per-tunnel
+  metrics, no audit trail, and no way to revoke "just this hostname" without
+  killing the whole process.
+- **It cannot be kept alive cleanly.** A watchdog can restart a dead quick
+  tunnel, but the restart *changes the URL* — so auto-recovery and a stable
+  client configuration are mutually exclusive on a quick tunnel.
+
+**Recommendation: spend ten minutes setting up a named tunnel on a domain you
+own.** The steps, all free on Cloudflare's standard plan:
+
+1. Add your domain to Cloudflare (it becomes a zone; Cloudflare assigns
+   nameservers).
+2. `cloudflared tunnel login` (pick the domain's zone).
+3. `cloudflared tunnel create <name>` — this issues credentials that live in
+   `~/.cloudflared/`.
+4. `cloudflared tunnel route dns <name> shim.yourdomain.com` — a stable CNAME
+   to the tunnel.
+5. Write a small config file (`~/.cloudflared/<name>.yml`) binding
+   `shim.yourdomain.com` to `http://127.0.0.1:8787`:
+
+   ```yaml
+   tunnel: <tunnel-id>
+   credentials-file: /Users/YOU/.cloudflared/<tunnel-id>.json
+   ingress:
+     - hostname: shim.yourdomain.com
+       service: http://127.0.0.1:8787
+     - service: http_status:404
+   ```
+
+6. Run it — ideally as a persistent service so it survives reboots:
+
+   ```sh
+   cloudflared tunnel --config ~/.cloudflared/<name>.yml run <name>
+   ```
+
+   (On macOS, register it with `launchd` exactly like the shim in the previous
+   section; on Linux, a `systemd --user` unit does the same job.)
+
+What you get: the hostname never changes again, the tunnel auto-reconnects to
+Cloudflare's edge on failure, you get per-tunnel metrics and logs in the
+Cloudflare dashboard, and you can put Cloudflare Access policies in front of
+the hostname for defense in depth on top of the shim's own `SHIM_CLIENT_KEY`.
+
+Keep using the quick tunnel while you evaluate; graduate to the named tunnel
+the day the shim becomes something you depend on.
   `SHIM_CLIENT_KEY` is what stops them getting further.
 
 ## Serving Cursor and Xcode at once

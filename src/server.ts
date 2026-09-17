@@ -26,7 +26,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { Capture } from "./capture.js";
+import { Capture, registerBodySecret } from "./capture.js";
 import { errorBody, jsonCompletion, jsonResponse, sseCompletion, sseResponse } from "./reply.js";
 import type { ShimConfig } from "./config.js";
 import { classifyBody, describeShape, type BodyShape } from "./shape.js";
@@ -563,6 +563,12 @@ async function serveCatalog(res: ServerResponse, cache: CatalogCache, config: Sh
  */
 function createRequestHandler(config: ShimConfig): (req: IncomingMessage, res: ServerResponse) => void {
   const capture = new Capture(config.captureDir);
+  // Scrub configured secrets from capture *bodies*, not just headers: agent
+  // transcripts absorb whatever was printed into the conversation (.env dumps,
+  // echoed keys), and the capture stores the body verbatim. See
+  // `registerBodySecret` in capture.ts.
+  registerBodySecret(config.apiKey, "MERGE_GATEWAY_API_KEY");
+  registerBodySecret(config.clientKey, "SHIM_CLIENT_KEY");
   const catalogCache: CatalogCache = {};
 
   return (req, res) => {
