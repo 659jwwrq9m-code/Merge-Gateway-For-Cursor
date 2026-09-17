@@ -776,6 +776,59 @@ merely annoys — so the failure mode is the harmless direction.
 
 Set `SHIM_FILTER_MODELS=0` (or `--no-model-filter`) for the raw 273.
 
+### Context limits
+
+Each entry also carries `context_length` and `max_output_tokens`:
+
+```json
+{
+  "id": "zai/glm-5.3-flash",
+  "object": "model",
+  "created": 0,
+  "owned_by": "zai",
+  "context_length": 1000000,
+  "max_output_tokens": 131000
+}
+```
+
+Two non-standard fields. OpenAI's schema has nowhere to put a context window,
+so a client that does not know them ignores them — Cursor and Xcode both read
+only `id` today, so this costs nothing and is there for a client that does look.
+The name `context_length` matches Ollama's own native `/api/tags` field and the
+model metadata Ollama Cloud documents, so a client already parsing that name
+from Ollama works unchanged.
+
+**This is a deliberate divergence from Ollama, not conformance to it.** Ollama
+Cloud publishes no context field on any endpoint — not its OpenAI-compatible
+`/v1/models`, not its native `/api/tags`. All 20 of its cloud models return only
+`families`, `family`, `format`, `parameter_size`, `parent_model`, and
+`quantization_level` in `details`. The 1M/262K figures its picker displays are
+hardcoded in the Ollama binary (`cmd/launch/models.go`), not served over the API.
+Gateway publishes real per-vendor windows, so the shim can be strictly more
+informative than the thing it is modelled on.
+
+#### Why the advertised number is the **minimum** across vendors
+
+Gateway routes across vendors per request, and vendors disagree. Of the 222
+tool-capable models, **47 publish different windows on different vendors**:
+
+| Model | Vendors | Advertised |
+| --- | --- | --- |
+| `anthropic/claude-sonnet-4-6` | `anthropic` 1,000,000 · `bedrock` 200,000 | **200,000** |
+| `zai/glm-5.3-flash` | `baseten` 1,048,576 · seven others 1,000,000 | **1,000,000** |
+| `deepseek/deepseek-v4-pro-0423` | `fireworks` 1,048,576 · `tera` 131,072 | **131,072** |
+
+Advertising the maximum would promise a window that a routed request may not
+have, and the failure is the one Ollama Cloud already exhibits: an over-long
+prompt is accepted and then hard-fails upstream with
+`The prompt is too long: …, model maximum context length: …`. Under-promising
+only means a client compacts slightly early, which is recoverable. A vendor
+publishing `null` or `0` is treated as publishing nothing, so a missing window
+never wins the minimum.
+
+A model with no published window omits both fields entirely and renders exactly
+as it did before this existed.
+
 ## How the translation works
 
 `src/translate.ts`, all pure and synchronous:
@@ -810,14 +863,16 @@ does not survive, the fix is a small amount of per-tool mapping in
 npm test
 ```
 
-156 checks, no network and no API key required:
+172 checks, no network and no API key required:
 
 - `scripts/translate-check.mjs` — 33 assertions over translation, idempotence,
   and edge cases (string input, images, `developer` role, reasoning-only items,
   unsupported tools, null content)
-- `scripts/model-filter-check.mjs` — 25 assertions over catalogue filtering:
+- `scripts/model-filter-check.mjs` — 41 assertions over catalogue filtering:
   tool-capability membership, multi-vendor qualification, the access-gated flag,
-  ordering, and graceful degradation on malformed payloads
+  ordering, graceful degradation on malformed payloads, and the context-limit
+  rules (minimum across vendors, `null`/`0` treated as absent, fields omitted
+  rather than zeroed)
 - `scripts/response-check.mjs` — 29 assertions over response translation: the
   `thinking` → `reasoning` rename, null-to-empty content, gateway-only key
   stripping, no-op frame dropping, tool-call preservation, and the

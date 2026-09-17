@@ -37,6 +37,27 @@ export interface CatalogModel {
    * look like a bug in the shim rather than a Gateway permission.
    */
   accessRequired: boolean;
+  /**
+   * The context window to advertise, or undefined when Gateway published none.
+   *
+   * **This is the minimum across the model's vendors, not the maximum.** Gateway
+   * routes across vendors per request, and vendors disagree: 47 of the 222
+   * tool-capable models have a different window on different vendors
+   * (`anthropic/claude-sonnet-4-6` is 1,000,000 on `anthropic` but 200,000 on
+   * `bedrock`). Advertising the maximum would promise a window a routed request
+   * may not have, and an over-long prompt then hard-fails upstream — the exact
+   * silent-`400` hazard Ollama Cloud exhibits. Under-promising only means a
+   * client compacts slightly early, which is recoverable.
+   *
+   * Ollama is not the reference for this: its Cloud `/v1/models` and `/api/tags`
+   * publish no context field at all, on any of its 20 models. The numbers its
+   * picker shows are compiled into the Ollama binary. Gateway publishes real
+   * ones, so this shim can be strictly more informative than the thing it is
+   * modelled on.
+   */
+  contextLength?: number;
+  /** Minimum `max_output_tokens` across vendors. Same reasoning as above. */
+  maxOutputTokens?: number;
 }
 
 /** An entry in the OpenAI `list` shape a model picker parses. */
@@ -45,10 +66,36 @@ export interface OpenAIModelEntry {
   object: "model";
   created: number;
   owned_by: string;
+  /**
+   * Non-standard, and deliberately so.
+   *
+   * The OpenAI schema has nowhere to put a context window, which is why Ollama
+   * omits it entirely. Clients that do not know the field ignore it — Cursor and
+   * Xcode both read only `id` today — so it costs nothing to include and is
+   * there for a client that does look. Named `context_length` to match Ollama's
+   * own native `/api/tags` field and Ollama Cloud's documented model metadata,
+   * so a client already parsing that name from Ollama works unchanged.
+   */
+  context_length?: number;
+  /** Minimum across vendors; see `CatalogModel.contextLength`. */
+  max_output_tokens?: number;
 }
 
 interface NativeVendor {
   capabilities?: { supports_tool_calling?: boolean } | null;
+  context_window?: number | null;
+  max_output_tokens?: number | null;
+}
+
+/**
+ * Smallest positive value in a list, or undefined when there is none.
+ *
+ * Vendors routinely publish `null` or `0` for these fields, and a `0` window
+ * would be worse than no window at all, so both are treated as absent.
+ */
+function minPositive(values: number[]): number | undefined {
+  const usable = values.filter((value) => Number.isFinite(value) && value > 0);
+  return usable.length > 0 ? Math.min(...usable) : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -91,8 +138,10 @@ export function readCatalog(payload: unknown): CatalogModel[] {
     const vendors = entry.vendors;
     if (!isRecord(vendors)) continue;
 
-    const capable = Object.values(vendors).some(
-      (vendor) => (vendor as NativeVendor | null)?.capabilities?.supports_tool_calling === true,
+    const vendorList = Object.values(vendors).filter(isRecord) as NativeVendor[];
+
+    const capable = vendorList.some(
+      (vendor) => vendor.capabilities?.supports_tool_calling === true,
     );
     if (!capable) continue;
 
@@ -102,6 +151,12 @@ export function readCatalog(payload: unknown): CatalogModel[] {
       displayName: typeof entry.display_name === "string" ? entry.display_name : entry.model,
       provider: typeof entry.provider === "string" ? entry.provider : "merge-gateway",
       accessRequired: entry.access_required === true,
+      contextLength: minPositive(
+        vendorList.map((vendor) => Number(vendor.context_window)).filter(Number.isFinite),
+      ),
+      maxOutputTokens: minPositive(
+        vendorList.map((vendor) => Number(vendor.max_output_tokens)).filter(Number.isFinite),
+      ),
     });
   }
 
@@ -119,6 +174,12 @@ export function readCatalog(payload: unknown): CatalogModel[] {
  * catalogue (`created_at` is null for every record). Pickers treat it as
  * informational and no client has been observed to sort on it; a fabricated
  * timestamp would be worse than an obviously absent one.
+ *
+ * `context_length` and `max_output_tokens` are attached only when Gateway
+ * actually published them. `JSON.stringify` drops an `undefined` value silently,
+ * which is the behaviour wanted here — but it also means a model with no
+ * published window renders byte-identically to the pre-existing four-key shape,
+ * so a client that cannot handle the extra field still parses this list.
  */
 export function toOpenAIModelList(catalog: CatalogModel[]): OpenAIModelEntry[] {
   return [...catalog]
@@ -126,10 +187,15 @@ export function toOpenAIModelList(catalog: CatalogModel[]): OpenAIModelEntry[] {
       if (a.accessRequired !== b.accessRequired) return a.accessRequired ? 1 : -1;
       return a.id.localeCompare(b.id);
     })
-    .map((model) => ({
-      id: model.id,
-      object: "model" as const,
-      created: 0,
-      owned_by: model.provider,
-    }));
+    .map((model) => {
+      const entry: OpenAIModelEntry = {
+        id: model.id,
+        object: "model" as const,
+        created: 0,
+        owned_by: model.provider,
+      };
+      if (model.contextLength !== undefined) entry.context_length = model.contextLength;
+      if (model.maxOutputTokens !== undefined) entry.max_output_tokens = model.maxOutputTokens;
+      return entry;
+    });
 }
