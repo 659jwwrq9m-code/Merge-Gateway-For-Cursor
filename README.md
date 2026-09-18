@@ -261,6 +261,34 @@ Use any editor to set your key in `.env`:
 MERGE_GATEWAY_API_KEY=your_key_here
 ```
 
+### Rotating the Gateway key
+
+When Merge issues you a new key, update the same line in `.env` — it is the
+only place the key lives, since Cursor and Xcode never see it:
+
+```ini
+MERGE_GATEWAY_API_KEY=your_new_gateway_key
+```
+
+Then restart the shim so the running process picks it up — launchd keeps the
+old key until you kick it:
+
+```sh
+launchctl kickstart -k gui/$(id -u)/com.vforcepros.merge-gateway-shim
+```
+
+Confirm the swap took by checking the startup log — the shim verifies the key
+against Gateway on boot, so a bad key is caught immediately:
+
+```sh
+tail -3 /tmp/merge-gateway-shim.log   # "shim ✓ key accepted, N model(s) visible"
+```
+
+(Without launchd, just stop `npm start` and start it again — same effect.)
+
+Other keys in `.env` are unrelated: `SHIM_CLIENT_KEY` is the token Cursor
+sends, and `OLLAMA_API_KEY` is only used by the Ollama comparison tests.
+
 ### Changing the port
 
 The shim listens on port **8787** by default. If that port is taken (anything
