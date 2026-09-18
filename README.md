@@ -1,7 +1,5 @@
 # merge-gateway-shim
 
-*By Chris Minshall*
-
 A small local proxy that lets **Cursor's Agent mode** and **Xcode's chat** route
 through **[Merge Gateway](https://docs.merge.dev/merge-gateway/get-started)**.
 
@@ -159,6 +157,20 @@ cd Merge-Gateway-For-Cursor
 npm install
 npm run build
 ```
+
+**Already running the launchd service?** Then the shim is already up on port
+8787 and a manual `npm start` fails with `EADDRINUSE` — that is the service,
+not a broken build. `npm run build` still works and is what you need after
+pulling updates: rebuild, then restart the service with
+`launchctl kickstart -k gui/$(id -u)/com.vforcepros.merge-gateway-shim`
+(see [Updating an installed shim](#updating-an-installed-shim)).
+
+**Already running the launchd service?** Then the shim is already up on port
+8787 and a manual `npm start` fails with `EADDRINUSE` — that is the service,
+not a broken build. `npm run build` still works and is what you need after
+pulling updates: rebuild, then restart the service with
+`launchctl kickstart -k gui/$(id -u)/com.vforcepros.merge-gateway-shim`
+(see [Updating an installed shim](#updating-an-installed-shim)).
 
 ### Windows
 
@@ -531,6 +543,70 @@ launchctl print gui/$(id -u)/com.vforcepros.merge-gateway-shim  # status
 launchctl kickstart -k gui/$(id -u)/com.vforcepros.merge-gateway-shim  # restart
 launchctl bootout gui/$(id -u)/com.vforcepros.merge-gateway-shim  # stop & unload
 ```
+
+`launchctl kickstart -k` is the one you will use most: it kills the running
+process and starts a fresh one in place — this is how you restart after changing
+`.env`, after editing code, or after any manual `kill`. After a `bootout`, load
+the service again with the same `launchctl load` command above; bootout removes
+the registration, not just the process.
+
+The tunnel runs the same way under its own label,
+`com.vforcepros.merge-gateway-tunnel`, with the same three commands.
+
+### Updating an installed shim
+
+Pulling new code is not enough — launchd keeps running whatever is already in
+`dist/`, so a stale build outlives the `git pull`. After every update:
+
+```sh
+cd /path/to/merge-gateway-shim
+git pull
+npm install        # only needed if package.json changed
+npm run build      # refresh dist/ — the running service uses this
+launchctl kickstart -k gui/$(id -u)/com.vforcepros.merge-gateway-shim
+curl http://127.0.0.1:8787/health
+```
+
+Forgetting the build or the restart leaves you on old code with new-looking
+sources — the most common "the fix didn't work" cause. The tunnel label does not
+need a kickstart unless its config changed.
+
+### The watchdog (optional, recommended)
+
+The repo ships `scripts/watchdog.sh`, a launchd job that runs every minute and
+self-heals the two most common outages: something else stealing port 8787 (it
+kills the squatter and restarts the shim), and the tunnel process dying (it
+restarts it). It logs its actions to `/tmp/shim-watchdog.log`.
+
+Create `~/Library/LaunchAgents/com.vforcepros.merge-gateway-shim-watchdog.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.vforcepros.merge-gateway-shim-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>/path/to/merge-gateway-shim/scripts/watchdog.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/shim-watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/shim-watchdog.log</string>
+  </dict>
+</plist>
+```
+
+Load it with the same `launchctl load` command as the shim. Before relying on
+it, open `scripts/watchdog.sh` and set its `LABEL` to the label you actually
+used for the shim service above.
 
 The service log lands in `/tmp/merge-gateway-shim.log`. On Windows, use a
 second PowerShell window, or register a scheduled task:
