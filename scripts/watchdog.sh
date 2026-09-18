@@ -5,7 +5,7 @@
 
 HEALTH="http://127.0.0.1:8787/health"
 LOG=/tmp/shim-watchdog.log
-LABEL="com.chrisminshall.merge-gateway-shim"
+LABEL="com.vforcepros.merge-gateway-shim"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 UID_N=$(id -u)
 TS() { date "+%Y-%m-%d %H:%M:%S"; }
@@ -39,10 +39,10 @@ fi
 launchctl kickstart -k "gui/$UID_N/$LABEL" 2>>"$LOG"
 sleep 3
 
-# --- 4. Tunnel: restart the named tunnel if it is gone -------------------
+# --- 4. Tunnel: restart the named tunnel if it is gone --------------------
 if ! pgrep -f 'cloudflared tunnel --config.*merge-gateway-shim.yml' >/dev/null 2>&1; then
   echo "$(TS) named tunnel process gone; restarting" >> "$LOG"
-  launchctl kickstart -k "gui/$UID_N/com.chrisminshall.merge-gateway-tunnel" 2>>"$LOG"
+  launchctl kickstart -k "gui/$UID_N/com.vforcepros.merge-gateway-tunnel" 2>>"$LOG"
   sleep 8
   echo "$(TS) named tunnel restarted (hostname unchanged: shim URL is permanent)" >> "$LOG"
 fi

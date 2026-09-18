@@ -3,14 +3,14 @@
 <plist version="1.0">
   <dict>
     <key>Label</key>
-    <string>com.chrisminshall.merge-gateway-shim</string>
+    <string>com.vforcepros.merge-gateway-shim</string>
     <key>ProgramArguments</key>
     <array>
-      <string>/Users/chrisminshall/.nvm/versions/node/v24.12.0/bin/node</string>
+      <string>/Users/YOU/.nvm/versions/node/vX.Y.Z/bin/node</string>
       <string>dist/index.js</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/chrisminshall/GitHub/Merge Gateway For Cursor</string>
+    <string>/path/to/merge-gateway-shim</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

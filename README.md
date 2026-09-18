@@ -1,5 +1,7 @@
 # merge-gateway-shim
 
+*By Chris Minshall*
+
 A small local proxy that lets **Cursor's Agent mode** and **Xcode's chat** route
 through **[Merge Gateway](https://docs.merge.dev/merge-gateway/get-started)**.
 
@@ -481,7 +483,7 @@ and Cursor starts reporting provider errors. A `launchd` user service avoids
 that entirely: it runs outside Cursor, restarts the shim if it dies, starts on
 login, and survives sleep and reboots.
 
-Create `~/Library/LaunchAgents/com.chrisminshall.merge-gateway-shim.plist`
+Create `~/Library/LaunchAgents/com.vforcepros.merge-gateway-shim.plist`
 (adapt the label, node path, and paths to your setup — `which node` gives the
 absolute node path, which launchd needs because it does not read nvm):
 
@@ -491,7 +493,7 @@ absolute node path, which launchd needs because it does not read nvm):
 <plist version="1.0">
   <dict>
     <key>Label</key>
-    <string>com.chrisminshall.merge-gateway-shim</string>
+    <string>com.vforcepros.merge-gateway-shim</string>
     <key>ProgramArguments</key>
     <array>
       <string>/Users/YOU/.nvm/versions/node/vX.Y.Z/bin/node</string>
@@ -516,7 +518,7 @@ absolute node path, which launchd needs because it does not read nvm):
 Load it and verify:
 
 ```sh
-launchctl load ~/Library/LaunchAgents/com.chrisminshall.merge-gateway-shim.plist
+launchctl load ~/Library/LaunchAgents/com.vforcepros.merge-gateway-shim.plist
 curl http://127.0.0.1:8787/health   # {"status":"ok","mode":"passthrough"}
 ```
 
@@ -525,9 +527,9 @@ within a few seconds — verified by killing it and watching it come back. Manag
 it with:
 
 ```sh
-launchctl print gui/$(id -u)/com.chrisminshall.merge-gateway-shim  # status
-launchctl kickstart -k gui/$(id -u)/com.chrisminshall.merge-gateway-shim  # restart
-launchctl bootout gui/$(id -u)/com.chrisminshall.merge-gateway-shim  # stop & unload
+launchctl print gui/$(id -u)/com.vforcepros.merge-gateway-shim  # status
+launchctl kickstart -k gui/$(id -u)/com.vforcepros.merge-gateway-shim  # restart
+launchctl bootout gui/$(id -u)/com.vforcepros.merge-gateway-shim  # stop & unload
 ```
 
 The service log lands in `/tmp/merge-gateway-shim.log`. On Windows, use a
