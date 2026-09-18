@@ -246,6 +246,26 @@ Use any editor to set your key in `.env`:
 MERGE_GATEWAY_API_KEY=your_key_here
 ```
 
+### Changing the port
+
+The shim listens on port **8787** by default. If that port is taken (anything
+else on your machine already bound to it — the shim will fail to start and say
+so), set `SHIM_PORT` in the same `.env`:
+
+```ini
+SHIM_PORT=8899
+```
+
+Then everywhere the README says `8787`, use your port instead — most importantly
+Cursor's **Override OpenAI Base URL**, which becomes
+`http://localhost:8899/v1`. Restart the shim after changing it; the
+`check:env` output confirms the new port on the `listen` line. If you run the
+shim under `launchd`/`systemd` (see the keepalive section), the service picks
+the variable up from `.env` on its next restart — no plist change needed.
+
+Other settings live in the same file; see the
+[Configuration reference](#configuration-reference) for the full list.
+
 Then verify it:
 
 ```sh
