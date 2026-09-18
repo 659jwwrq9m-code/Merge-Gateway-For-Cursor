@@ -84,11 +84,12 @@ the key everywhere locks Xcode out; not requiring it leaves a tunnel open. See
         Cursor (Agent mode)              Xcode (chat)
    request:  Responses-shaped        request:  Chat Completions
    path:     /v1/chat/completions    path:     /v1/v1/chat/completions
-   key:      sent                    key:      none available
+   via:      Cloudflare Tunnel       via:      loopback (no key needed)
+   key:      SHIM_CLIENT_KEY         key:      none available
                      │                          │
                      └────────────┬─────────────┘
                                   ▼
-                    merge-gateway-shim  (localhost:8787)
+                    merge-gateway-shim  (loopback:8787)
                      1. classify the body
                      2. capture it to disk (credentials redacted)
                      3. normalise → strict Chat Completions
@@ -256,10 +257,12 @@ so), set `SHIM_PORT` in the same `.env`:
 SHIM_PORT=8899
 ```
 
-Then everywhere the README says `8787`, use your port instead — most importantly
-Cursor's **Override OpenAI Base URL**, which becomes
-`http://localhost:8899/v1`. Restart the shim after changing it; the
-`check:env` output confirms the new port on the `listen` line. If you run the
+Then everywhere the README says `8787`, use your port instead. The port shows up
+in two client-facing places: the **tunnel config's** ingress target
+(`http://127.0.0.1:8899`, which cloudflared dials) and **Xcode's locally hosted
+provider** port field. Cursor's base URL is untouched by a port change — it is
+the tunnel hostname, which stays the same. Restart the shim after changing it;
+the `check:env` output confirms the new port on the `listen` line. If you run the
 shim under `launchd`/`systemd` (see the keepalive section), the service picks
 the variable up from `.env` on its next restart — no plist change needed.
 
@@ -281,7 +284,7 @@ shim resolved configuration
   listen              http://localhost:8787/v1
   mode                capture only (no upstream calls)
   capture dir         /path/to/merge-gateway-shim/captures
-  cursor base url     http://localhost:8787/v1
+  loopback url        http://localhost:8787/v1 (Xcode / tunnel target)
 
 shim verifying key against Gateway…
 shim ✓ key accepted, 214 model(s) visible
@@ -371,29 +374,40 @@ scheme so a capture still shows *how* auth was sent. Captures are safe to share.
 **Capture mode is the default**, so you can do this before spending anything.
 The shim answers every request locally and records it.
 
+Cursor does not talk to the shim over loopback. The shim binds loopback only —
+by design, since it holds your Gateway key — so Cursor reaches it through a
+**Cloudflare Tunnel** that forwards a public hostname to your machine. If you
+have not set that up yet, do
+[Reaching it from another machine (Cloudflare Tunnel)](#reaching-it-from-another-machine-cloudflare-tunnel)
+first: it takes a few minutes and gives you a stable `https://` hostname
+(`https://shim.example.com` in the examples below; a temporary
+`https://something.trycloudflare.com` works too while you experiment).
+
 In Cursor:
 
 1. **Settings → Cursor Settings → Models**
 2. Enable **OpenAI API Key** — see the note below on what goes here
-3. Enable **Override OpenAI Base URL** → `http://localhost:8787/v1`
+3. Enable **Override OpenAI Base URL** → `https://shim.example.com/v1`
+   (your tunnel hostname, plus `/v1`)
 4. Click **+ Add Custom Model** and add a Gateway model id, e.g.
    `zai/glm-5.3-flash` or `anthropic/claude-opus-5`
 5. Switch to **Agent mode** and send a message
 
-**What to put in the API key field.** If you have not set `SHIM_CLIENT_KEY`, any
-non-empty placeholder works — the shim holds the real Gateway key, and Cursor
-only requires the field to be filled. If you *have* set `SHIM_CLIENT_KEY`, this
-field must contain that exact value: it is the token the shim checks on every
-request that can reach a completion. A wrong value here produces the shim's own
-`401 invalid_api_key`, not a Gateway error.
+**What to put in the API key field.** The exact value of `SHIM_CLIENT_KEY` from
+your `.env` — no `Bearer` prefix. Every request Cursor sends arrives through the
+tunnel, and the shim rejects tunnelled requests that do not carry that token. A
+wrong value here produces the shim's own `401 invalid_api_key`, not a Gateway
+error.
 
-Use `localhost` rather than `127.0.0.1`. The shim binds both loopback stacks,
-and `localhost` is what Cursor and Xcode produce by default.
+**Do not use `localhost` or `127.0.0.1` in the base URL.** Cursor cannot reach a
+loopback-bound shim that way; the base URL must be the tunnel's public `https://`
+hostname. (Xcode is the opposite — it is configured locally and never sees the
+tunnel. See [Setting up Xcode](#setting-up-xcode).)
 
 If you get connection or TLS errors, set
 **Settings → Cursor Settings → Network → HTTP Compatibility Mode** to
 **HTTP/1.1**. The same setting lives in the desktop and web settings panes.
-Cursor defaults to HTTP/2, and many local proxies do not serve it.
+Cursor defaults to HTTP/2, and many proxies do not serve it.
 
 ### Model ids
 
@@ -533,7 +547,11 @@ it, and the next section covers what to do about it.
 ## Reaching it from another machine (Cloudflare Tunnel)
 
 Loopback is the right default: the shim holds your Gateway key, so anything that
-can reach it can spend your credit. Sometimes you genuinely need it reachable
+can reach it can spend your credit. It is also the *only* default that works for
+Xcode, which has no way to authenticate. But **Cursor itself is a client on the
+far side of this section** — it cannot reach a loopback-bound shim directly
+(see [Step 2](#step-2--point-cursor-at-the-shim)), so even a one-person setup
+needs a tunnel with `SHIM_CLIENT_KEY` set. Sometimes you also need it reachable
 from elsewhere — a remote dev box, a teammate, a cloud agent.
 
 **`SHIM_CLIENT_KEY` is mandatory the moment you do this.** Without it, an
@@ -589,9 +607,10 @@ printf 'metrics: 127.0.0.1:20241\n' > /tmp/cf-quick.yml
 cloudflared tunnel --config /tmp/cf-quick.yml --url http://localhost:8787
 ```
 
-It prints a URL like `https://something-something.trycloudflare.com`. Point
-Cursor's base URL at `https://that-host/v1` and set the API key to your
-`SHIM_CLIENT_KEY`.
+It prints a URL like `https://something-something.trycloudflare.com`. That host
+is what Cursor's base URL is built from: `https://that-host/v1`, with your
+`SHIM_CLIENT_KEY` in the API key field. (Loopback stays reserved for Xcode and
+the tunnel's own far end; never put `localhost` in Cursor.)
 
 Then confirm the gate is actually closed — this should return `401`, not `200`:
 
@@ -664,6 +683,10 @@ own.** The steps, all free on Cloudflare's standard plan:
    (On macOS, register it with `launchd` exactly like the shim in the previous
    section; on Linux, a `systemd --user` unit does the same job.)
 
+7. Point Cursor at the permanent hostname once: **Override OpenAI Base URL** →
+   `https://shim.yourdomain.com/v1`, with `SHIM_CLIENT_KEY` in the API key
+   field. It never needs updating again.
+
 What you get: the hostname never changes again, the tunnel auto-reconnects to
 Cloudflare's edge on failure, you get per-tunnel metrics and logs in the
 Cloudflare dashboard, and you can put Cloudflare Access policies in front of
@@ -679,9 +702,10 @@ One shim serves both editors simultaneously. That constraint shapes two details,
 and both are easy to break by "fixing" one client at the other's expense.
 
 **Paths are matched by suffix, not exactly.** Cursor takes its base URL verbatim,
-so `http://localhost:8787/v1` yields `/v1/models`. Xcode's provider field holds a
-host with no `/v1` in it and Xcode appends one itself, so the *same* base URL
-yields `/v1/v1/models`. Rejecting either spelling would force the two editors
+so a base URL of `https://shim.example.com/v1` (the tunnel hostname) yields
+`/v1/models`. Xcode's provider field holds a host with no `/v1` in it and Xcode
+appends one itself, so a base URL of `http://localhost:8787` yields
+`/v1/v1/models`. Rejecting either spelling would force the two editors
 onto different ports, which is why `handle` strips a leading `/v1` (however many
 times it repeats) before routing. Doubled inner slashes are collapsed too.
 
@@ -692,10 +716,13 @@ single port.
 
 Loopback alone cannot establish "from this machine", because **a Cloudflare
 tunnel dials the shim over loopback** — a request from the public internet
-arrives from `127.0.0.1`. It does not look local by *header*: cloudflared always
+arrives from `127.0.0.1`, including every request Cursor sends through the
+tunnel. It does not look local by *header*: cloudflared always
 adds `cf-ray` and friends, and an outsider cannot forge those, because the origin
 has no inbound port. The only way in is the tunnel, which adds them. Address plus
-the absence of proxy headers is therefore a reliable local signal.
+the absence of proxy headers is therefore a reliable local signal — and the
+reason Xcode works with no key while Cursor (tunnelled) must present
+`SHIM_CLIENT_KEY`.
 
 Verified against one running shim:
 

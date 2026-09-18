@@ -164,7 +164,11 @@ async function check(flags: ShimFlags = {}): Promise<number> {
   process.stderr.write(`  listen              http://${config.host}:${config.port}/v1\n`);
   process.stderr.write(`  mode                ${config.passthrough ? "passthrough → Gateway" : "capture only (no upstream calls)"}\n`);
   process.stderr.write(`  capture dir         ${config.capture ? config.captureDir : "(disabled)"}\n`);
-  process.stderr.write(`  cursor base url     http://${config.host}:${config.port}/v1\n`);
+  // Loopback is what the shim binds and what Xcode (and the Cloudflare tunnel's
+  // far end) dial — but it is *not* what Cursor should be pointed at: Cursor
+  // reaches the shim through a tunnel hostname, and a loopback base URL does
+  // not work there. Label the line accordingly so nobody copies it into Cursor.
+  process.stderr.write(`  loopback url        http://${config.host}:${config.port}/v1 (Xcode / tunnel target)\n`);
 
   if (!config.apiKey) {
     process.stderr.write("\n");
